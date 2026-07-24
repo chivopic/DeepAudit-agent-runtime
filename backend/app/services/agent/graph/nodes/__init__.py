@@ -375,8 +375,9 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
         }
 
     usage = state.get("usage") or ModelUsage()
+    budget: RunBudget = state.get("budget") or req.budget.model_copy(deep=True)
     rationale = "priority by path heuristics"
-    # Optional LLM call (FakeLLM in tests)
+    # Optional LLM call (FakeLLM in tests) — counts against budget
     try:
         resp = await runtime.llm.complete(
             [
@@ -393,6 +394,7 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
             ]
         )
         usage = usage.add(resp.usage)
+        budget = budget.consume_model_call(tokens=resp.usage.total_tokens or 0)
         if resp.content:
             rationale = f"llm:{resp.content[:200]}"
     except Exception as exc:  # noqa: BLE001 — planner must not fail hard
@@ -406,7 +408,7 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
                 language=f.language,
                 analyzer="llm" if runtime.offline else "hybrid",
                 priority=f.priority,
-                max_tokens=min(4000, (state.get("budget") or req.budget).remaining_tokens() or 4000),
+                max_tokens=min(4000, budget.remaining_tokens() or 4000),
             )
         )
     tasks.sort(key=lambda t: t.priority, reverse=True)
@@ -423,6 +425,7 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
         "plan": plan,
         "pending_task_ids": [t.id for t in tasks],
         "usage": usage,
+        "budget": budget,
         "events": [
             _event("node.completed", "plan_audit", task_count=len(tasks))
         ],
@@ -797,11 +800,28 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
         for f in final_findings
         if f.verification_status is VerificationStatus.NOT_RUN
     )
-    summary = (
-        f"Audit completed with {len(final_findings)} finding(s). "
-        f"Phase 1: {not_run} finding(s) have verification_status=not_run "
-        f"(no untrusted code execution)."
+    budget = state.get("budget")
+    pending = list(state.get("pending_task_ids") or [])
+    plan = state.get("plan")
+    planned = len(plan.tasks) if plan is not None else 0
+    budget_hit = bool(budget is not None and budget.is_exhausted())
+    incomplete = bool(pending) or (
+        budget_hit and planned > 0 and (budget.files_analyzed if budget else 0) < planned
     )
+    terminal = AuditStatus.PARTIAL if incomplete else AuditStatus.COMPLETED
+    if incomplete:
+        summary = (
+            f"Audit partial ({terminal.value}): budget or scope limited run with "
+            f"{len(final_findings)} finding(s); "
+            f"{len(pending)} task(s) remaining. "
+            f"Phase 1: {not_run} finding(s) have verification_status=not_run."
+        )
+    else:
+        summary = (
+            f"Audit completed with {len(final_findings)} finding(s). "
+            f"Phase 1: {not_run} finding(s) have verification_status=not_run "
+            f"(no untrusted code execution)."
+        )
     sections = [
         AuditReportSection(
             title="Executive Summary",
@@ -831,16 +851,20 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
     report = AuditReport(
         audit_id=state["audit_id"],
         title="Security Audit Report",
-        status=AuditStatus.COMPLETED,
+        status=terminal,
         summary=summary,
         sections=sections,
         findings=final_findings,
         plan=state.get("plan"),
         usage=state.get("usage") or ModelUsage(),
+        metadata={
+            "budget_exhausted": budget_hit,
+            "pending_task_ids": pending,
+        },
     ).recount_severities()
 
     return {
-        "status": AuditStatus.COMPLETED,
+        "status": terminal,
         "report": report,
         "normalized_findings": final_findings,
         "events": [
@@ -849,6 +873,9 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
                 "generate_report",
                 findings=len(final_findings),
                 not_run=not_run,
+                status=terminal.value,
+                budget_exhausted=budget_hit,
             )
         ],
+        "meta": {"budget_exhausted": budget_hit, "terminal_status": terminal.value},
     }

@@ -139,6 +139,24 @@ async def test_graph_end_to_end_with_fake_llm():
 
 
 @pytest.mark.asyncio
+async def test_budget_exhaustion_marks_partial():
+    """max_model_calls=1: plan consumes the only call → stop before files; PARTIAL."""
+    runtime = _runtime()
+    app = compile_audit_graph()
+    req = _request(
+        budget=RunBudget(max_tokens=50_000, max_model_calls=1, max_files=20)
+    )
+    state = empty_audit_state(audit_id=req.id, request=req)
+    result = await _ainvoke(app, state, runtime, req.id)
+    assert result["status"] is AuditStatus.PARTIAL
+    assert result["report"].status is AuditStatus.PARTIAL
+    assert result["budget"].is_exhausted()
+    assert "partial" in result["report"].summary.lower() or result.get("meta", {}).get(
+        "budget_exhausted"
+    )
+
+
+@pytest.mark.asyncio
 async def test_graph_validation_failure_without_request():
     app = compile_audit_graph()
     result = await _ainvoke(

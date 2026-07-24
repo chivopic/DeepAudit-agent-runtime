@@ -55,7 +55,8 @@ class VerificationResult(BaseModel):
     request_id: str
     finding_id: str
     status: VerificationStatus = VerificationStatus.INCONCLUSIVE
-    execution_status: ExecutionStatus = ExecutionStatus.SUCCEEDED
+    # Default SKIPPED so "not run / static only" cannot look like successful sandbox exec.
+    execution_status: ExecutionStatus = ExecutionStatus.SKIPPED
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     summary: str = Field(default="", max_length=5000)
     details: dict[str, Any] = Field(default_factory=dict)

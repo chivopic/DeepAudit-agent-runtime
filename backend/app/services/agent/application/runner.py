@@ -157,7 +157,7 @@ class AuditRunner:
             except ValueError:
                 status = AuditStatus.COMPLETED
 
-        # Prefer explicit cancel flag / runtime cancel over a completed report.
+        # Prefer explicit cancel flag / runtime cancel over a completed/partial report.
         if result.get("cancelled") or self.is_cancelled(aid):
             status = AuditStatus.CANCELLED
 
@@ -167,7 +167,11 @@ class AuditRunner:
         usage = result.get("usage")
 
         # Optional: park report markdown as artifact
-        if report is not None and getattr(report, "summary", None) and status is not AuditStatus.CANCELLED:
+        if (
+            report is not None
+            and getattr(report, "summary", None)
+            and status not in {AuditStatus.CANCELLED}
+        ):
             try:
                 ref = await self.artifacts.put(
                     report.summary,
@@ -225,7 +229,9 @@ class AuditRunner:
 
         if row.status in {
             AuditStatus.COMPLETED,
+            AuditStatus.PARTIAL,
             AuditStatus.CANCELLED,
+            AuditStatus.FAILED,
         }:
             return AuditRunResult(
                 audit_id=audit_id,

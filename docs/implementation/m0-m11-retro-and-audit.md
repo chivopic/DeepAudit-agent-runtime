@@ -268,3 +268,22 @@ Confirmed Critical/High themes: unauth graph-audits + local_path LFI surface; ca
 | Docs / process | 9/10 | Status + implementation docs complete |
 
 **Bottom line:** The M0–M11 stack is a **sound skeleton** with the right boundaries and a strong deterministic test harness. It is **not** yet a drop-in production replacement for ReAct. Highest-value hardening: **auth on graph-audits**, **wire ToolRegistry/Tracer/Budget into nodes**, **true cancel/resume**, **Postgres adapters**.
+
+---
+
+## Part D — Codex re-audit remediations (2026-07-24)
+
+Codex second-pass findings implemented as **Phase 0/1**:
+
+| Codex theme | Fix |
+|-------------|-----|
+| C1 unauth + client `local_path` | `GRAPH_AUDITS_ENABLED` / `FIXTURE_ONLY`; reject absolute host paths; require `fixture_files`; size caps |
+| Sync start blocks cancel | `start_async` + HTTP 202; optional `wait` for tests |
+| Budget → fake COMPLETED | `AuditStatus.PARTIAL`; plan LLM `consume_model_call`; `generate_report` terminal PARTIAL |
+| MCP empty list still invoke | discovery cache + allowlist; registry routes only known tools |
+| verification `SUCCEEDED` on skip | default + static/human/not_run paths use `ExecutionStatus.SKIPPED` |
+| Mapper field loss | `vulnerability_type` / `ai_confidence` / `is_verified` in from/to legacy |
+
+**Tests:** 128 passed (agent suite M1–M11 + Phase 0/1 cases).
+
+Remaining product-gated: full JWT/project ACL on `/graph-audits`, harness enforcement in nodes, true mid-graph resume, multi-worker events.

@@ -232,7 +232,11 @@ class MCPTransport(Protocol):
 
 
 class MCPToolAdapter:
-    """Adapter over an MCP transport. Never exposes forbidden tool names."""
+    """Adapter over an MCP transport. Never exposes forbidden tool names.
+
+    Discovery is required before invoke: empty discovery + no allowlist → deny.
+    Sync ``list_tools`` returns a cached discovery snapshot when available.
+    """
 
     def __init__(
         self,
@@ -242,20 +246,24 @@ class MCPToolAdapter:
     ) -> None:
         self.transport = transport
         self.allowlist = allowlist
+        self._discovered: Optional[set[str]] = None
+        self._cached_specs: list[ToolSpec] = []
 
     def list_tools(self) -> list[ToolSpec]:
-        # Sync façade used by registry; prefer async list via invoke path in prod
-        return []
+        """Return last discovery snapshot (empty until ``alist_tools`` / ``refresh``)."""
+        return list(self._cached_specs)
 
     async def alist_tools(self) -> list[ToolSpec]:
         raw = await self.transport.list_tools()
         out: list[ToolSpec] = []
+        names: set[str] = set()
         for item in raw:
             name = str(item.get("name") or "")
             if not name or name in FORBIDDEN_TOOL_NAMES:
                 continue
             if self.allowlist is not None and name not in self.allowlist:
                 continue
+            names.add(name)
             out.append(
                 ToolSpec(
                     name=name,
@@ -264,22 +272,34 @@ class MCPToolAdapter:
                     tags=["mcp"],
                 )
             )
+        self._discovered = names
+        self._cached_specs = list(out)
         return out
+
+    def _mcp_name_allowed(self, name: str) -> tuple[bool, str]:
+        if name in FORBIDDEN_TOOL_NAMES:
+            return False, "forbidden tool"
+        if self.allowlist is not None and name not in self.allowlist:
+            return False, f"tool not in MCP allowlist: {name}"
+        # Fail closed: require discovery cache or explicit allowlist membership.
+        if self._discovered is not None:
+            if name not in self._discovered:
+                return False, f"tool not discovered via MCP list_tools: {name}"
+            return True, ""
+        if self.allowlist is not None and name in self.allowlist:
+            # Allowlist alone is an explicit operator grant (still no shell family).
+            return True, ""
+        return False, "MCP tools not discovered; call alist_tools first or set allowlist"
 
     async def invoke(self, request: ToolInput) -> ToolOutput:
         t0 = time.perf_counter()
-        if request.name in FORBIDDEN_TOOL_NAMES:
+        ok, reason = self._mcp_name_allowed(request.name)
+        if not ok:
             return ToolOutput(
                 name=request.name,
                 success=False,
-                error="forbidden tool",
-                metadata={"policy_denied": True},
-            )
-        if self.allowlist is not None and request.name not in self.allowlist:
-            return ToolOutput(
-                name=request.name,
-                success=False,
-                error=f"tool not in MCP allowlist: {request.name}",
+                error=reason,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
                 metadata={"policy_denied": True},
             )
         try:
@@ -424,6 +444,13 @@ class ToolRegistry:
                 out.append(spec)
         return out
 
+    def _adapter_knows(self, adapter: ToolProtocol, name: str) -> bool:
+        """True only when the adapter's *sync* discovery lists the tool."""
+        try:
+            return any(s.name == name for s in adapter.list_tools())
+        except Exception:  # noqa: BLE001
+            return False
+
     async def invoke(self, request: ToolInput) -> ToolOutput:
         if request.name in FORBIDDEN_TOOL_NAMES:
             out = ToolOutput(
@@ -444,37 +471,35 @@ class ToolRegistry:
             self._log(request, out)
             return out
 
-        # Prefer adapter that lists the tool; else try all
-        known = {s.name for s in self.list_tools()}
-        for ad in self.adapters:
-            names = {s.name for s in ad.list_tools()}
-            # MCP adapters may have empty sync list — still try invoke
-            if names and request.name not in names and not hasattr(ad, "alist_tools"):
-                continue
-            if names and request.name not in names:
-                # has alist — try anyway only if not in any known
-                if request.name in known:
-                    continue
-            out = await ad.invoke(request)
-            if out.success or out.error not in {
-                f"unknown builtin tool: {request.name}",
-                f"no mock for {request.name}",
-            }:
-                # MCP unknown still may return success=False with other message
-                if out.error and out.error.startswith("unknown builtin"):
-                    continue
-                if out.error and out.error.startswith("no mock"):
-                    continue
-                self._log(request, out)
-                return out
+        # Route only to adapters that advertise the tool (no blind try-all).
+        candidates = [ad for ad in self.adapters if self._adapter_knows(ad, request.name)]
+        if not candidates:
+            # MCP adapters may need async discovery before list_tools is populated.
+            for ad in self.adapters:
+                alist = getattr(ad, "alist_tools", None)
+                if callable(alist):
+                    try:
+                        await alist()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if self._adapter_knows(ad, request.name):
+                        candidates.append(ad)
+        if not candidates:
+            out = ToolOutput(
+                name=request.name,
+                success=False,
+                error=f"no adapter for tool: {request.name}",
+                metadata={"policy_denied": True, "undiscovered": True},
+            )
+            self._log(request, out)
+            return out
 
-        # Last chance: invoke each adapter
         last = ToolOutput(
             name=request.name,
             success=False,
             error=f"no adapter for tool: {request.name}",
         )
-        for ad in self.adapters:
+        for ad in candidates:
             out = await ad.invoke(request)
             last = out
             if out.success:
@@ -483,6 +508,13 @@ class ToolRegistry:
             if out.metadata.get("policy_denied"):
                 self._log(request, out)
                 return out
+            # Skip "unknown" from wrong adapter; try next candidate
+            err = out.error or ""
+            if err.startswith("unknown builtin") or err.startswith("no mock"):
+                continue
+            # Non-policy failure from the owning adapter — return it
+            self._log(request, out)
+            return out
         self._log(request, last)
         return last
 

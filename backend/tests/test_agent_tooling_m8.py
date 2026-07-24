@@ -99,6 +99,8 @@ async def test_mcp_adapter_filters_forbidden_and_allowlist():
     assert "shell.exec" not in names
     assert "other" not in names
 
+    # Discover before invoke (or rely on allowlist grant)
+    await ad.alist_tools()
     out = await ad.invoke(ToolInput(name="safe_scan", arguments={}))
     assert out.success
     assert out.data == {"hits": 1}
@@ -106,6 +108,37 @@ async def test_mcp_adapter_filters_forbidden_and_allowlist():
     blocked = await ad.invoke(ToolInput(name="other", arguments={}))
     assert not blocked.success
     assert blocked.metadata.get("policy_denied") is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_undiscovered_tool_denied_without_allowlist():
+    transport = InMemoryMCPTransport(
+        tools=[{"name": "safe_scan", "description": "ok"}],
+        handlers={"safe_scan": lambda a: {"hits": 1}, "secret_tool": lambda a: "nope"},
+    )
+    ad = MCPToolAdapter(transport)  # no allowlist, no discovery yet
+    denied = await ad.invoke(ToolInput(name="secret_tool", arguments={}))
+    assert not denied.success
+    assert denied.metadata.get("policy_denied") is True
+
+    # After discovery, only listed tools work
+    await ad.alist_tools()
+    ok = await ad.invoke(ToolInput(name="safe_scan", arguments={}))
+    assert ok.success
+    still = await ad.invoke(ToolInput(name="secret_tool", arguments={}))
+    assert not still.success
+
+
+@pytest.mark.asyncio
+async def test_registry_no_try_all_undiscovered_mcp():
+    transport = InMemoryMCPTransport(
+        tools=[],  # empty discovery
+        handlers={"hidden": lambda a: "leaked"},
+    )
+    reg = ToolRegistry(adapters=[MCPToolAdapter(transport)])
+    out = await reg.invoke(ToolInput(name="hidden", arguments={}))
+    assert not out.success
+    assert out.metadata.get("policy_denied") or "no adapter" in (out.error or "")
 
 
 @pytest.mark.asyncio

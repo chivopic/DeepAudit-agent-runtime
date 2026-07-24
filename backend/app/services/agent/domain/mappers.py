@@ -147,6 +147,39 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
     if confidence > 1.0:
         confidence = min(1.0, confidence / 100.0)
 
+    # Prefer explicit category; fall back to legacy vulnerability_type / type.
+    category = (
+        data.get("category")
+        or data.get("vulnerability_type")
+        or data.get("type")
+    )
+
+    # Prefer confidence; accept ai_confidence (0-1 or 0-100).
+    if data.get("confidence") is None and data.get("ai_confidence") is not None:
+        try:
+            confidence = float(data["ai_confidence"])
+            if confidence > 1.0:
+                confidence = min(1.0, confidence / 100.0)
+        except (TypeError, ValueError):
+            pass
+
+    vstatus = _parse_verification_status(
+        data.get("verification_status") or data.get("verification")
+    )
+    # Legacy is_verified=True → confirmed (only when no explicit verification_status)
+    if (
+        data.get("verification_status") is None
+        and data.get("verification") is None
+        and data.get("is_verified") is True
+    ):
+        vstatus = VerificationStatus.CONFIRMED
+
+    meta = dict(data.get("metadata") or {})
+    if data.get("vulnerability_type") and "vulnerability_type" not in meta:
+        meta["vulnerability_type"] = data.get("vulnerability_type")
+    if data.get("is_verified") is not None and "is_verified" not in meta:
+        meta["is_verified"] = bool(data.get("is_verified"))
+
     kwargs: dict[str, Any] = {
         "audit_id": (
             str(data["audit_id"])
@@ -157,10 +190,8 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
         "description": description,
         "severity": _parse_severity(data.get("severity")),
         "status": _parse_finding_status(data.get("status")),
-        "verification_status": _parse_verification_status(
-            data.get("verification_status") or data.get("verification")
-        ),
-        "category": data.get("category") or data.get("type"),
+        "verification_status": vstatus,
+        "category": category,
         "cwe_id": data.get("cwe_id") or data.get("cwe"),
         "owasp": data.get("owasp"),
         "location": location,
@@ -175,7 +206,7 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
         "recommendation": data.get("recommendation") or data.get("remediation"),
         "references": list(data.get("references") or []),
         "tags": list(data.get("tags") or []),
-        "metadata": dict(data.get("metadata") or {}),
+        "metadata": meta,
     }
     if data.get("id"):
         kwargs["id"] = str(data["id"])
@@ -201,6 +232,7 @@ def finding_to_legacy_dict(finding: Finding) -> dict[str, Any]:
         "status": finding.status.value,
         "verification_status": finding.verification_status.value,
         "category": finding.category,
+        "vulnerability_type": finding.category or finding.rule_id or "other",
         "cwe_id": finding.cwe_id,
         "owasp": finding.owasp,
         "file_path": loc.file_path if loc else None,
@@ -210,11 +242,14 @@ def finding_to_legacy_dict(finding: Finding) -> dict[str, Any]:
         "class_name": loc.class_name if loc else None,
         "code_snippet": snippet,
         "confidence": finding.confidence,
+        "ai_confidence": finding.confidence,
+        "is_verified": finding.verification_status.value == "confirmed",
         "risk_score": finding.risk_score,
         "analyzer": finding.analyzer,
         "rule_id": finding.rule_id,
         "fingerprint": finding.fingerprint,
         "recommendation": finding.recommendation,
+        "suggestion": finding.recommendation,
         "references": list(finding.references),
         "tags": list(finding.tags),
         "metadata": dict(finding.metadata),

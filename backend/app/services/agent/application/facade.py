@@ -6,6 +6,7 @@ Production ReAct path remains default. Callers can opt into LangGraph via
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -33,6 +34,7 @@ class GraphAuditFacade:
     ) -> None:
         self.runner = runner or AuditRunner(store=InMemoryBusinessStore())
         self.bus = bus or get_graph_event_bus()
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     async def start(
         self,
@@ -42,19 +44,22 @@ class GraphAuditFacade:
         project_id: Optional[str] = None,
         name: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Run graph audit and publish events to the bus."""
+        """Run graph audit to completion and publish events to the bus."""
         await self.bus.publish_raw(
             request.id,
             {"kind": "task_start", "message": "langgraph audit started"},
         )
         result = await self.runner.run(request, runtime=runtime, audit_id=request.id)
         await self.bus.publish_many(request.id, result.events)
+        terminal_ok = result.status in {
+            AuditStatus.COMPLETED,
+            AuditStatus.PARTIAL,
+            AuditStatus.CANCELLED,
+        }
         await self.bus.publish_raw(
             request.id,
             {
-                "kind": "task_complete"
-                if result.status is AuditStatus.COMPLETED
-                else "task.error",
+                "kind": "task_complete" if terminal_ok else "task.error",
                 "message": f"status={result.status.value}",
             },
         )
@@ -63,13 +68,78 @@ class GraphAuditFacade:
             result, project_id=project_id or request.project_id, name=name
         )
 
+    async def start_async(
+        self,
+        request: AuditRequest,
+        *,
+        runtime: Optional[GraphRuntime] = None,
+        project_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Register PENDING run and schedule graph execution in the background.
+
+        Returns immediately so cancel can race against mid-run nodes.
+        """
+        await self.runner.store.upsert_run(
+            request.id, request=request, status=AuditStatus.PENDING
+        )
+        await self.bus.publish_raw(
+            request.id,
+            {"kind": "task_start", "message": "langgraph audit queued"},
+        )
+
+        async def _run() -> None:
+            try:
+                result = await self.runner.run(
+                    request, runtime=runtime, audit_id=request.id
+                )
+                await self.bus.publish_many(request.id, result.events)
+                terminal_ok = result.status in {
+                    AuditStatus.COMPLETED,
+                    AuditStatus.PARTIAL,
+                    AuditStatus.CANCELLED,
+                }
+                await self.bus.publish_raw(
+                    request.id,
+                    {
+                        "kind": "task_complete" if terminal_ok else "task.error",
+                        "message": f"status={result.status.value}",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("background graph audit failed: %s", request.id)
+                await self.bus.publish_raw(
+                    request.id,
+                    {"kind": "task.error", "message": str(exc)},
+                )
+            finally:
+                await self.bus.close(request.id)
+
+        task = asyncio.create_task(_run(), name=f"graph-audit-{request.id}")
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+        return {
+            "id": request.id,
+            "project_id": project_id or request.project_id or "",
+            "name": name or request.title,
+            "status": "pending",
+            "current_phase": "planning",
+            "runtime": "langgraph",
+            "findings_count": 0,
+            "message": "accepted; running in background",
+        }
+
     async def cancel(self, task_id: str) -> dict[str, Any]:
         self.runner.request_cancel(task_id)
         row = await self.runner.get(task_id)
-        if row and row.status is AuditStatus.COMPLETED:
+        if row and row.status in {
+            AuditStatus.COMPLETED,
+            AuditStatus.PARTIAL,
+        }:
             return {
                 "id": task_id,
-                "status": "completed",
+                "status": row.status.value,
                 "message": "already completed",
             }
         # If not started or mid-flight: flag set; if never run, mark cancelled in store
@@ -155,7 +225,7 @@ class GraphAuditFacade:
         manifest = raw.get("manifest")
         if manifest is not None and hasattr(manifest, "files"):
             total = len(manifest.files)
-        return task_summary_from_run(
+        summary = task_summary_from_run(
             audit_id=result.audit_id,
             project_id=project_id,
             status=result.status,
@@ -168,6 +238,8 @@ class GraphAuditFacade:
             completed_at=result.record.completed_at if result.record else None,
             created_at=result.record.created_at if result.record else None,
         )
+        summary["runtime"] = "langgraph"
+        return summary
 
 
 # Singleton for optional dual-path experiments

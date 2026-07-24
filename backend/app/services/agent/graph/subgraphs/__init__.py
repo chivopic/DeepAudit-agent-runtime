@@ -85,7 +85,7 @@ async def verify_finding(
             request_id=req.id,
             finding_id=finding.id,
             status=VerificationStatus.PENDING,
-            execution_status=ExecutionStatus.SUCCEEDED,
+            execution_status=ExecutionStatus.SKIPPED,
             confidence=finding.confidence,
             summary="awaiting human review",
         )
@@ -108,7 +108,8 @@ async def verify_finding(
             request_id=req.id,
             finding_id=finding.id,
             status=status,
-            execution_status=ExecutionStatus.SUCCEEDED,
+            # No sandbox process ran — never report SUCCEEDED for non-exec paths.
+            execution_status=ExecutionStatus.SKIPPED,
             confidence=conf,
             summary=summary,
             details={"strategy": req.strategy},
@@ -184,7 +185,7 @@ async def verify_finding(
         request_id=req.id,
         finding_id=finding.id,
         status=VerificationStatus.NOT_RUN,
-        execution_status=ExecutionStatus.SUCCEEDED,
+        execution_status=ExecutionStatus.SKIPPED,
         confidence=finding.confidence,
         summary="verification not run",
     )

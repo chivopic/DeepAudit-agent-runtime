@@ -5,11 +5,13 @@ from __future__ import annotations
 import pytest
 
 from app.services.agent.domain import (
+    ExecutionStatus,
     Finding,
     FindingStatus,
     Severity,
     SourceLocation,
     VerificationRequest,
+    VerificationResult,
     VerificationStatus,
 )
 from app.services.agent.graph.subgraphs import (
@@ -43,6 +45,12 @@ async def test_phase1_static_recheck_skips_sandbox():
         VerificationStatus.INCONCLUSIVE,
     }
     assert vf.verification_notes
+
+
+def test_verification_result_default_execution_not_succeeded():
+    r = VerificationResult(request_id="r1", finding_id="f1")
+    assert r.execution_status is ExecutionStatus.SKIPPED
+    assert r.execution_status is not ExecutionStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio

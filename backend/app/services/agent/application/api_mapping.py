@@ -24,6 +24,7 @@ _STATUS_MAP: dict[str, str] = {
     AuditStatus.VERIFYING.value: "verifying",
     AuditStatus.REPORTING.value: "reporting",
     AuditStatus.COMPLETED.value: "completed",
+    AuditStatus.PARTIAL.value: "partial",
     AuditStatus.FAILED.value: "failed",
     AuditStatus.CANCELLED.value: "cancelled",
     AuditStatus.PAUSED.value: "paused",
@@ -39,6 +40,7 @@ _PHASE_MAP: dict[str, str] = {
     AuditStatus.VERIFYING.value: "verification",
     AuditStatus.REPORTING.value: "reporting",
     AuditStatus.COMPLETED.value: "reporting",
+    AuditStatus.PARTIAL.value: "reporting",
 }
 
 
@@ -166,7 +168,9 @@ def task_summary_from_run(
         "low_count": sev["low"],
         "quality_score": 0.0,
         "security_score": None,
-        "progress_percentage": 100.0 if st == "completed" else 0.0,
+        "progress_percentage": (
+            100.0 if st in {"completed", "partial", "cancelled", "failed"} else 0.0
+        ),
         "created_at": created_at or now,
         "started_at": created_at,
         "completed_at": completed_at,

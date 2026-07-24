@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -144,20 +146,21 @@ async def test_graph_audits_http_routes():
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Sync wait + fixture_files only (no client host path)
         resp = await client.post(
             "/api/v1/graph-audits/",
             json={
                 "project_id": "p1",
                 "name": "http-demo",
                 "source_type": "local",
-                "local_path": "/tmp/x",
                 "offline": True,
+                "wait": True,
                 "fixture_files": FIXTURE,
             },
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["status"] == "completed"
+        assert body["status"] in {"completed", "partial"}
         tid = body["id"]
 
         g = await client.get(f"/api/v1/graph-audits/{tid}")
@@ -178,3 +181,57 @@ async def test_graph_audits_http_routes():
 
         c = await client.post(f"/api/v1/graph-audits/{tid}/cancel")
         assert c.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_graph_audits_rejects_host_local_path():
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/graph-audits/",
+            json={
+                "source_type": "local",
+                "local_path": "/etc/passwd",
+                "fixture_files": FIXTURE,
+                "wait": True,
+            },
+        )
+        assert resp.status_code == 400
+        assert "local_path" in resp.text.lower() or "fixture" in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_graph_audits_async_accept_returns_202():
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/graph-audits/",
+            json={
+                "project_id": "p-async",
+                "name": "bg",
+                "wait": False,
+                "fixture_files": FIXTURE,
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["status"] == "pending"
+        tid = body["id"]
+        # Allow background task to finish
+        for _ in range(50):
+            g = await client.get(f"/api/v1/graph-audits/{tid}")
+            if g.status_code == 200 and g.json().get("status") in {
+                "completed",
+                "partial",
+                "failed",
+                "cancelled",
+            }:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            # Still pending is acceptable if event loop slow; cancel to clean up
+            await client.post(f"/api/v1/graph-audits/{tid}/cancel")

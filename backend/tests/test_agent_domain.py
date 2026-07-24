@@ -64,6 +64,7 @@ class TestEnums:
             AuditStatus.COMPLETED,
         }
         assert len(stages) == 9
+        assert AuditStatus.PARTIAL.value == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -448,3 +449,21 @@ class TestMappers:
             {"title": "x", "description": "y", "severity": "ultra"}
         )
         assert f.severity is Severity.MEDIUM
+
+    def test_from_legacy_vulnerability_type_and_ai_confidence(self):
+        f = finding_from_legacy_dict(
+            {
+                "title": "SQLi",
+                "description": "query",
+                "vulnerability_type": "sql_injection",
+                "ai_confidence": 85,
+                "is_verified": True,
+            }
+        )
+        assert f.category == "sql_injection"
+        assert f.confidence == pytest.approx(0.85)
+        assert f.verification_status is VerificationStatus.CONFIRMED
+        d = finding_to_legacy_dict(f)
+        assert d["vulnerability_type"] == "sql_injection"
+        assert d["ai_confidence"] == pytest.approx(0.85)
+        assert d["is_verified"] is True

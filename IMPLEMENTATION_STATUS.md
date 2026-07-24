@@ -5,9 +5,9 @@
 
 ## Current milestone
 
-**M11 — Agent Harness** · status: **COMPLETE** (2026-07-24)
+**Post-M11 Codex Phase 0/1 hardening** · status: **COMPLETE** (2026-07-24)
 
-Goal through M11 is **done**. Full M0–M11 stack is additive dual-path beside production ReAct.
+M0–M11 remains complete. Phase 0/1 trust + async + budget/MCP/mapper fixes landed same day.
 
 ## Milestone roadmap
 
@@ -43,7 +43,7 @@ uv run pytest \
   tests/test_agent_evals_m10.py \
   tests/test_agent_harness_m11.py \
   -q
-# 2026-07-24 post-audit residual: **121 passed**
+# 2026-07-24 post Codex Phase 0/1: **128 passed**
 ```
 
 ## Post-M11 audit hardening (same day)
@@ -58,7 +58,18 @@ Landed after M11 audit pass:
 - `ExecutionStatus.SKIPPED` for NullSandbox non-execution.
 - Tests: mid-run cancel, artifact escape, sandbox path traversal.
 
-**Still open (product / next work):** auth on `/graph-audits`, harness/tools/tracer wired into nodes, true mid-graph resume, multi-worker cancel/events.
+### Codex Phase 0/1 (2026-07-24)
+
+| Fix | Detail |
+|-----|--------|
+| Trust boundary | `GRAPH_AUDITS_*` settings; reject client host `local_path`; fixture-only default; fixture path/size caps |
+| Async start | `GraphAuditFacade.start_async` → 202; `wait=true` sync for tests |
+| Budget terminal | `AuditStatus.PARTIAL`; plan LLM counts budget; report not fake COMPLETED on exhaust |
+| MCP fail-closed | discovery required; registry no try-all; empty list_tools cannot invoke |
+| Verification | `execution_status` default `SKIPPED` (not SUCCEEDED) on non-exec paths |
+| Mapper | `vulnerability_type` / `ai_confidence` / `is_verified` round-trip |
+
+**Still open (product / next work):** full JWT/project ACL on `/graph-audits` (flag + fixture gate only), harness tools/tracer wired into nodes, true mid-graph resume, multi-worker cancel/events.
 
 ## Package map (new under `services/agent/`)
 
@@ -142,4 +153,6 @@ Hardening applied after audit (same day):
 - Eval status_terminal no longer vacuous
 - Observability redact_value single-pass
 
-Still open (tracked in audit doc): graph-audits auth, harness enforcement inside nodes, true cancel/resume, multi-worker event bus.
+Phase 0/1 closed host-path LFI surface + async cancel race + MCP try-all + budget COMPLETED lie + mapper field loss.
+
+Still open (tracked in audit doc): full authz parity, harness enforcement inside nodes, true mid-graph resume, multi-worker event bus.

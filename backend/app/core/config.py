@@ -107,7 +107,19 @@ class Settings(BaseSettings):
     AGENT_MAX_ITERATIONS: int = 50  # Agent 最大迭代次数
     AGENT_TOKEN_BUDGET: int = 100000  # Agent Token 预算
     AGENT_TIMEOUT_SECONDS: int = 1800  # Agent 超时时间（30分钟）
-    
+
+    # LangGraph dual-path experimental surface (/api/v1/graph-audits)
+    # Default True so offline fixture demos work; set False to hard-disable in prod.
+    GRAPH_AUDITS_ENABLED: bool = True
+    # When True, only fixture_files / server-controlled workspace — reject client host paths.
+    GRAPH_AUDITS_FIXTURE_ONLY: bool = True
+    # Max files accepted in fixture_files payload (DoS guard).
+    GRAPH_AUDITS_MAX_FIXTURE_FILES: int = 200
+    # Max total UTF-8 bytes across fixture_files values.
+    GRAPH_AUDITS_MAX_FIXTURE_BYTES: int = 2_000_000
+    # When False (default), start returns immediately and run continues in background.
+    GRAPH_AUDITS_SYNC_START: bool = False
+
     # 沙箱配置（必须）
     SANDBOX_IMAGE: str = "deepaudit/sandbox:latest"  # 沙箱 Docker 镜像
     SANDBOX_MEMORY_LIMIT: str = "512m"  # 沙箱内存限制

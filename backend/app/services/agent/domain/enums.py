@@ -47,6 +47,8 @@ class AuditStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     PAUSED = "paused"
+    # Budget hit before full plan finished; report still emitted with partial findings
+    PARTIAL = "partial"
 
 
 class ExecutionStatus(str, Enum):
