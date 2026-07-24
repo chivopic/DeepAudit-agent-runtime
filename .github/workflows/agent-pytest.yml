@@ -1,0 +1,51 @@
+name: Agent runtime tests
+
+on:
+  push:
+    branches: [main, master, "v*"]
+    paths:
+      - "backend/**"
+      - ".github/workflows/agent-pytest.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/agent-pytest.yml"
+
+jobs:
+  pytest-agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run agent runtime unit tests (M1–M11)
+        run: |
+          uv run pytest \
+            tests/test_agent_domain.py \
+            tests/test_agent_graph_m2.py \
+            tests/test_agent_persistence_m3.py \
+            tests/test_agent_facade_m4.py \
+            tests/test_agent_context_m5.py \
+            tests/test_agent_sandbox_m6.py \
+            tests/test_agent_verification_m7.py \
+            tests/test_agent_tooling_m8.py \
+            tests/test_agent_observability_m9.py \
+            tests/test_agent_evals_m10.py \
+            tests/test_agent_harness_m11.py \
+            -q --tb=short
+
+      - name: Run eval CI suite
+        run: uv run python -m tests.evals.runner --ci

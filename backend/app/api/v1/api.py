@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, users, projects, tasks, scan, members, config, database, prompts, rules, agent_tasks, embedding_config, ssh_keys
+from app.api.v1.endpoints import auth, users, projects, tasks, scan, members, config, database, prompts, rules, agent_tasks, embedding_config, ssh_keys, graph_audits
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
@@ -13,5 +13,7 @@ api_router.include_router(database.router, prefix="/database", tags=["database"]
 api_router.include_router(prompts.router, prefix="/prompts", tags=["prompts"])
 api_router.include_router(rules.router, prefix="/rules", tags=["rules"])
 api_router.include_router(agent_tasks.router, prefix="/agent-tasks", tags=["agent-tasks"])
+# Additive LangGraph dual-path (M4); FE default remains agent-tasks
+api_router.include_router(graph_audits.router, prefix="/graph-audits", tags=["graph-audits"])
 api_router.include_router(embedding_config.router, prefix="/embedding", tags=["embedding"])
 api_router.include_router(ssh_keys.router, prefix="/ssh-keys", tags=["ssh-keys"])
