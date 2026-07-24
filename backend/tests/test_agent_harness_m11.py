@@ -78,10 +78,20 @@ async def test_harness_start_end_to_end():
     assert all(f.verification_status is VerificationStatus.NOT_RUN for f in result.findings)
     flat = tracer.get_spans_flat()
     assert any(s.name == "audit.run" for s in flat)
+    # Nodes now emit graph.node / tool.call / llm.call spans when harness wires tracer
+    span_names = {s.name for s in flat}
+    assert any(n.startswith("graph.node.") for n in span_names)
+    assert "tool.call" in span_names or "llm.call" in span_names
     assert rt.tools.list_tools()  # tools materialised
     # tool allowlist default includes builtins
     names = {s.name for s in rt.tools.list_tools()}
     assert "list_files" in names
+    # analyze path should have invoked heuristic_scan via ToolRegistry
+    kinds = [e.get("kind") for e in (result.events or [])]
+    assert "tool.call" in kinds
+    # budget manager mirrored from graph after run
+    assert rt.budget_manager.budget.model_calls_used >= 1
+    assert rt.budget_manager.budget.tool_calls_used >= 1
 
 
 @pytest.mark.asyncio

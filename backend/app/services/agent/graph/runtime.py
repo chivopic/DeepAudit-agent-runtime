@@ -16,7 +16,11 @@ _runtime_ctx: ContextVar[Optional["GraphRuntime"]] = ContextVar(
 
 @dataclass
 class GraphRuntime:
-    """Injectable dependencies for graph nodes (M2 skeleton)."""
+    """Injectable dependencies for graph nodes (M2 skeleton).
+
+    Optional governance hooks (tools / tracer / budget_manager) are set by the
+    Agent Harness or façade so nodes can enforce policies mid-run.
+    """
 
     llm: LLMGateway = field(default_factory=FakeLLM)
     workspace_root: Optional[Path] = None
@@ -25,6 +29,12 @@ class GraphRuntime:
     extra: dict[str, Any] = field(default_factory=dict)
     # Cooperative cancel: runner sets this; nodes poll via is_cancelled().
     cancel_check: Optional[Any] = None  # Callable[[], bool]
+    # ToolRegistry | None — allowlisted tools for analyze nodes
+    tools: Optional[Any] = None
+    # Tracer | None — observability; falls back to get_tracer() if unset
+    tracer: Optional[Any] = None
+    # BudgetManager | None — harness-level budget mirror (optional)
+    budget_manager: Optional[Any] = None
 
     def is_cancelled(self) -> bool:
         fn = self.cancel_check
@@ -34,6 +44,24 @@ class GraphRuntime:
             return bool(fn())
         except Exception:  # noqa: BLE001
             return False
+
+    def get_tools(self) -> Any:
+        if self.tools is not None:
+            return self.tools
+        return self.extra.get("tools")
+
+    def get_tracer(self) -> Any:
+        if self.tracer is not None:
+            return self.tracer
+        extra_t = self.extra.get("tracer")
+        if extra_t is not None:
+            return extra_t
+        try:
+            from app.services.agent.observability import get_tracer
+
+            return get_tracer()
+        except Exception:  # noqa: BLE001
+            return None
 
 
 def set_runtime(runtime: GraphRuntime):

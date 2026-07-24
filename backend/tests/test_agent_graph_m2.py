@@ -286,3 +286,50 @@ async def test_memory_checkpointer_resume_thread():
         assert snap.values.get("status") is AuditStatus.COMPLETED
     finally:
         reset_runtime(token)
+
+
+@pytest.mark.asyncio
+async def test_analyze_uses_tool_registry_and_tracer():
+    """When tools/tracer/budget_manager are injected, analyze_file uses them."""
+    from app.services.agent.harness import BudgetManager
+    from app.services.agent.observability import Tracer
+    from app.services.agent.tooling import default_tool_registry
+
+    tracer = Tracer(service_name="m2-tools")
+    tools = default_tool_registry(files=FIXTURE_FILES)
+    budget = RunBudget(max_tokens=50_000, max_model_calls=50, max_files=20)
+    bm = BudgetManager(budget=budget.model_copy(deep=True))
+    runtime = GraphRuntime(
+        llm=FakeLLM(),
+        offline=True,
+        tools=tools,
+        tracer=tracer,
+        budget_manager=bm,
+        extra={"fixture_files": FIXTURE_FILES},
+    )
+    app = compile_audit_graph()
+    req = _request(budget=budget)
+    state = empty_audit_state(audit_id=req.id, request=req)
+    result = await _ainvoke(app, state, runtime, req.id)
+
+    assert result["status"] is AuditStatus.COMPLETED
+    kinds = [e.get("kind") for e in (result.get("events") or [])]
+    assert "tool.call" in kinds
+    assert result["budget"].tool_calls_used >= 1
+    # BudgetManager is synced from graph budget (mirror, not double-count)
+    assert bm.budget.tool_calls_used >= 1
+    assert bm.budget.model_calls_used >= 1
+    flat = tracer.get_spans_flat()
+    names = {s.name for s in flat}
+    assert any(n.startswith("graph.node.") for n in names)
+    assert "tool.call" in names
+    assert "llm.call" in names
+    # tool hits may surface as candidate findings with tool analyzer
+    tool_findings = [
+        f
+        for f in result["normalized_findings"]
+        if (f.analyzer or "").startswith("tool:")
+        or any(ev.kind == "tool" for ev in (f.evidence or []))
+    ]
+    # fixture has os.system / SELECT — either node heuristic or tool hits
+    assert result["normalized_findings"] or tool_findings

@@ -158,11 +158,18 @@ class AgentRuntime:
 
     def _build_runtime(self) -> GraphRuntime:
         llm = self.model_router.resolve(self.spec)
+        tools = self.tools
         return GraphRuntime(
             llm=llm,
             offline=self.spec.offline,
+            tools=tools,
+            tracer=self.tracer,
+            budget_manager=self.budget_manager,
             extra={
                 "max_parallel_analyzers": self.spec.max_parallel_analyzers,
+                "tools": tools,
+                "tracer": self.tracer,
+                "budget_manager": self.budget_manager,
                 **({"fixture_files": self.tool_router.files} if self.tool_router.files else {}),
             },
         )

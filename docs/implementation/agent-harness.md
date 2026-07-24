@@ -30,6 +30,19 @@ AgentSpec → AgentRuntime.start / resume / cancel / stream_events
 - Findings remain `verification_status=NOT_RUN`
 - Production ReAct path (`/api/v1/agent-tasks/*`) **unchanged**
 
+## Mid-run governance (post-M11 wiring)
+
+`AgentRuntime._build_runtime` injects into `GraphRuntime`:
+
+| Field | Source | Node consumption |
+|-------|--------|------------------|
+| `tools` | `ToolRouter` → `ToolRegistry` | `analyze_file` invokes allowlisted `heuristic_scan` |
+| `tracer` | harness `Tracer` | `plan_audit` / `analyze_file` open `graph.node.*`, `tool.call`, `llm.call` spans |
+| `budget_manager` | `BudgetManager.from_spec` | graph `RunBudget` is source of truth; `_sync_budget_manager` mirrors after each analyze/plan step (no double-count via `note_*`) |
+
+Nodes without a registry still run heuristics + FakeLLM (backward compatible). Tool denials and missing adapters are non-fatal; events carry `tool.call` / `tool.error`.
+
 ## Tests
 
-`tests/test_agent_harness_m11.py`
+- `tests/test_agent_harness_m11.py` — end-to-end spans + tool events + budget mirror
+- `tests/test_agent_graph_m2.py::test_analyze_uses_tool_registry_and_tracer`

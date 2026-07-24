@@ -86,6 +86,31 @@ def _event(kind: str, message: str, **extra: Any) -> dict[str, Any]:
     return payload
 
 
+def _sync_budget_manager(runtime: GraphRuntime, budget: RunBudget) -> None:
+    """Keep harness BudgetManager in sync with graph RunBudget when present."""
+    bm = runtime.budget_manager or runtime.extra.get("budget_manager")
+    if bm is not None and hasattr(bm, "budget"):
+        bm.budget = budget
+
+
+def _node_span(runtime: GraphRuntime, node_name: str, **attrs: Any):
+    """Return a context manager for node spans (no-op if no tracer)."""
+    from contextlib import nullcontext
+
+    tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
+    if tracer is None:
+        return nullcontext()
+    try:
+        from app.services.agent.observability import SPAN_GRAPH_NODE
+
+        return tracer.span(
+            f"{SPAN_GRAPH_NODE}.{node_name}",
+            **{"node.name": node_name, **attrs},
+        )
+    except Exception:  # noqa: BLE001
+        return nullcontext()
+
+
 def _lang_for(path: str) -> Optional[str]:
     ext = Path(path).suffix.lower()
     return {
@@ -377,49 +402,56 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
     usage = state.get("usage") or ModelUsage()
     budget: RunBudget = state.get("budget") or req.budget.model_copy(deep=True)
     rationale = "priority by path heuristics"
-    # Optional LLM call (FakeLLM in tests) — counts against budget
-    try:
-        resp = await runtime.llm.complete(
-            [
-                LLMMessage(role="system", content="You plan security audits. Reply JSON."),
-                LLMMessage(
-                    role="user",
-                    content=json.dumps(
-                        {
-                            "files": [f.path for f in manifest.files[:50]],
-                            "languages": req.languages,
-                        }
+    with _node_span(runtime, "plan_audit", **{"audit.id": state.get("audit_id")}):
+        # Optional LLM call (FakeLLM in tests) — counts against budget
+        try:
+            resp = await runtime.llm.complete(
+                [
+                    LLMMessage(
+                        role="system", content="You plan security audits. Reply JSON."
                     ),
-                ),
-            ]
-        )
-        usage = usage.add(resp.usage)
-        budget = budget.consume_model_call(tokens=resp.usage.total_tokens or 0)
-        if resp.content:
-            rationale = f"llm:{resp.content[:200]}"
-    except Exception as exc:  # noqa: BLE001 — planner must not fail hard
-        logger.warning("plan_audit llm failed: %s", exc)
-
-    tasks: list[AuditTaskSpec] = []
-    for f in manifest.files:
-        tasks.append(
-            AuditTaskSpec(
-                target_path=f.path,
-                language=f.language,
-                analyzer="llm" if runtime.offline else "hybrid",
-                priority=f.priority,
-                max_tokens=min(4000, budget.remaining_tokens() or 4000),
+                    LLMMessage(
+                        role="user",
+                        content=json.dumps(
+                            {
+                                "files": [f.path for f in manifest.files[:50]],
+                                "languages": req.languages,
+                            }
+                        ),
+                    ),
+                ]
             )
-        )
-    tasks.sort(key=lambda t: t.priority, reverse=True)
+            usage = usage.add(resp.usage)
+            tokens = resp.usage.total_tokens or 0
+            budget = budget.consume_model_call(tokens=tokens)
+            if resp.content:
+                rationale = f"llm:{resp.content[:200]}"
+        except Exception as exc:  # noqa: BLE001 — planner must not fail hard
+            logger.warning("plan_audit llm failed: %s", exc)
 
-    plan = AuditPlan(
-        audit_id=state["audit_id"],
-        tasks=tasks,
-        strategy="sequential",  # M2: sequential analyze loop
-        max_parallel=1,
-        rationale=rationale,
-    )
+        tasks: list[AuditTaskSpec] = []
+        for f in manifest.files:
+            tasks.append(
+                AuditTaskSpec(
+                    target_path=f.path,
+                    language=f.language,
+                    analyzer="llm" if runtime.offline else "hybrid",
+                    priority=f.priority,
+                    max_tokens=min(4000, budget.remaining_tokens() or 4000),
+                )
+            )
+        tasks.sort(key=lambda t: t.priority, reverse=True)
+
+        plan = AuditPlan(
+            audit_id=state["audit_id"],
+            tasks=tasks,
+            strategy="sequential",  # M2: sequential analyze loop
+            max_parallel=1,
+            rationale=rationale,
+        )
+        # Single source of truth: graph budget → harness BudgetManager (no double-count).
+        _sync_budget_manager(runtime, budget)
+
     return {
         "status": AuditStatus.PLANNING,
         "plan": plan,
@@ -524,7 +556,11 @@ async def finalize_cancelled(
 
 
 async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
-    """Analyze the next pending task; emit candidate findings."""
+    """Analyze the next pending task; emit candidate findings.
+
+    When ``GraphRuntime.tools`` is set, runs allowlisted ``heuristic_scan`` /
+    ``read_snippet`` tools and charges ``tool_calls_used`` on the budget.
+    """
     runtime = get_runtime(config)
     if runtime.is_cancelled() or state.get("cancelled"):
         return {
@@ -542,7 +578,9 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
         }
 
     budget: RunBudget = state.get("budget") or RunBudget()
-    if budget.is_exhausted():
+    if budget.is_exhausted() or (
+        runtime.budget_manager is not None and runtime.budget_manager.exhausted()
+    ):
         return {
             "errors": [
                 NodeError(
@@ -571,82 +609,178 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
             ],
         }
 
-    # Load content
-    content = ""
-    fixture_files: dict[str, str] = dict(runtime.extra.get("fixture_files") or {})
-    if task.target_path in fixture_files:
-        content = fixture_files[task.target_path]
-    else:
-        root = _resolve_workspace(state, runtime)
-        if root:
-            content = _safe_read_under_root(Path(root), task.target_path)
+    tool_events: list[dict[str, Any]] = []
+    with _node_span(
+        runtime,
+        "analyze_file",
+        **{"task.id": task_id, "path": task.target_path},
+    ):
+        # Load content
+        content = ""
+        fixture_files: dict[str, str] = dict(runtime.extra.get("fixture_files") or {})
+        if task.target_path in fixture_files:
+            content = fixture_files[task.target_path]
+        else:
+            root = _resolve_workspace(state, runtime)
+            if root:
+                content = _safe_read_under_root(Path(root), task.target_path)
 
-    candidates = _heuristic_candidates(task, content)
-    usage = state.get("usage") or ModelUsage()
+        candidates = _heuristic_candidates(task, content)
+        usage = state.get("usage") or ModelUsage()
 
-    # Fake / real LLM enrichment
-    try:
-        resp = await runtime.llm.complete(
-            [
-                LLMMessage(
-                    role="system",
-                    content="Return JSON array of findings [{title,description,severity,line}].",
-                ),
-                LLMMessage(
-                    role="user",
-                    content=json.dumps(
-                        {
-                            "path": task.target_path,
-                            "content": content[:4000],
-                        }
-                    ),
-                ),
-            ]
-        )
-        usage = usage.add(resp.usage)
-        budget = budget.consume_model_call(tokens=resp.usage.total_tokens or 0)
-        # Parse optional structured findings from FakeLLM
-        text = (resp.content or "").strip()
-        if text.startswith("["):
+        # Optional ToolRegistry: allowlisted heuristic_scan
+        tools = runtime.get_tools() if hasattr(runtime, "get_tools") else None
+        if tools is not None and not budget.tool_calls_exhausted():
             try:
-                arr = json.loads(text)
-                for item in arr:
-                    line = int(item.get("line") or 1)
-                    loc = SourceLocation(
-                        file_path=task.target_path,
-                        start_line=line,
-                        end_line=line,
+                from contextlib import nullcontext
+
+                from app.services.agent.observability import SPAN_TOOL_CALL
+                from app.services.agent.tooling import ToolInput
+
+                tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
+                tool_cm = (
+                    tracer.span(
+                        SPAN_TOOL_CALL,
+                        **{"tool.name": "heuristic_scan", "path": task.target_path},
                     )
-                    sev_raw = str(item.get("severity") or "medium").lower()
-                    try:
-                        sev = Severity(sev_raw)
-                    except ValueError:
-                        sev = Severity.MEDIUM
-                    candidates.append(
-                        CandidateFinding(
-                            title=str(item.get("title") or "LLM finding"),
-                            description=str(item.get("description") or item.get("title") or ""),
-                            severity=sev,
-                            location=loc,
-                            evidence=[
-                                Evidence(
-                                    kind="model",
-                                    summary="llm candidate",
-                                    location=loc,
-                                    confidence=0.55,
-                                )
-                            ],
-                            confidence=0.55,
-                            analyzer="llm",
-                            source_task_id=task.id,
+                    if tracer is not None
+                    else nullcontext()
+                )
+                with tool_cm:
+                    tout = await tools.invoke(
+                        ToolInput(
+                            name="heuristic_scan",
+                            arguments={"path": task.target_path},
+                            audit_id=state.get("audit_id"),
                         )
                     )
-            except json.JSONDecodeError:
-                pass
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("analyze_file llm failed: %s", exc)
+                budget = budget.consume_tool_call()
+                tool_events.append(
+                    _event(
+                        "tool.call",
+                        "heuristic_scan",
+                        success=tout.success,
+                        path=task.target_path,
+                        error=tout.error,
+                    )
+                )
+                if tout.success and isinstance(tout.data, dict):
+                    hits = tout.data.get("hits") or []
+                    if isinstance(hits, list):
+                        for hit in hits[:20]:
+                            needle = str(hit)
+                            loc = SourceLocation(
+                                file_path=task.target_path, start_line=1, end_line=1
+                            )
+                            candidates.append(
+                                CandidateFinding(
+                                    title=f"Tool hit: {needle}",
+                                    description=f"heuristic_scan reported {needle}",
+                                    severity=Severity.MEDIUM,
+                                    location=loc,
+                                    evidence=[
+                                        Evidence(
+                                            kind="tool",
+                                            summary=f"tool:{needle}",
+                                            location=loc,
+                                            confidence=0.5,
+                                        )
+                                    ],
+                                    confidence=0.5,
+                                    analyzer="tool:heuristic_scan",
+                                    rule_id=f"tool:{needle}",
+                                    source_task_id=task.id,
+                                )
+                            )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("analyze_file tool invoke failed: %s", exc)
+                tool_events.append(
+                    _event("tool.error", str(exc)[:200], path=task.target_path)
+                )
 
-    budget = budget.consume_file()
+        # Fake / real LLM enrichment
+        try:
+            from contextlib import nullcontext
+
+            from app.services.agent.observability import SPAN_LLM_CALL
+
+            tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
+            llm_cm = (
+                tracer.span(
+                    SPAN_LLM_CALL, **{"path": task.target_path, "node": "analyze_file"}
+                )
+                if tracer is not None
+                else nullcontext()
+            )
+            with llm_cm:
+                resp = await runtime.llm.complete(
+                    [
+                        LLMMessage(
+                            role="system",
+                            content=(
+                                "Return JSON array of findings "
+                                "[{title,description,severity,line}]."
+                            ),
+                        ),
+                        LLMMessage(
+                            role="user",
+                            content=json.dumps(
+                                {
+                                    "path": task.target_path,
+                                    "content": content[:4000],
+                                }
+                            ),
+                        ),
+                    ]
+                )
+            usage = usage.add(resp.usage)
+            tokens = resp.usage.total_tokens or 0
+            budget = budget.consume_model_call(tokens=tokens)
+            # Parse optional structured findings from FakeLLM
+            text = (resp.content or "").strip()
+            if text.startswith("["):
+                try:
+                    arr = json.loads(text)
+                    for item in arr:
+                        line = int(item.get("line") or 1)
+                        loc = SourceLocation(
+                            file_path=task.target_path,
+                            start_line=line,
+                            end_line=line,
+                        )
+                        sev_raw = str(item.get("severity") or "medium").lower()
+                        try:
+                            sev = Severity(sev_raw)
+                        except ValueError:
+                            sev = Severity.MEDIUM
+                        candidates.append(
+                            CandidateFinding(
+                                title=str(item.get("title") or "LLM finding"),
+                                description=str(
+                                    item.get("description") or item.get("title") or ""
+                                ),
+                                severity=sev,
+                                location=loc,
+                                evidence=[
+                                    Evidence(
+                                        kind="model",
+                                        summary="llm candidate",
+                                        location=loc,
+                                        confidence=0.55,
+                                    )
+                                ],
+                                confidence=0.55,
+                                analyzer="llm",
+                                source_task_id=task.id,
+                            )
+                        )
+                except json.JSONDecodeError:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("analyze_file llm failed: %s", exc)
+
+        budget = budget.consume_file()
+        _sync_budget_manager(runtime, budget)
 
     return {
         "status": AuditStatus.ANALYZING,
@@ -662,7 +796,8 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
                 task_id=task_id,
                 path=task.target_path,
                 candidates=len(candidates),
-            )
+            ),
+            *tool_events,
         ],
     }
 

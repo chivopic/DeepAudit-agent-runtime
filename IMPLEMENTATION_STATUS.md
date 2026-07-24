@@ -44,6 +44,7 @@ uv run pytest \
   tests/test_agent_harness_m11.py \
   -q
 # 2026-07-24 post Codex Phase 0/1: **128 passed**
+# 2026-07-24 node tools/tracer/budget wiring: **129 passed**
 ```
 
 ## Post-M11 audit hardening (same day)
@@ -69,7 +70,16 @@ Landed after M11 audit pass:
 | Verification | `execution_status` default `SKIPPED` (not SUCCEEDED) on non-exec paths |
 | Mapper | `vulnerability_type` / `ai_confidence` / `is_verified` round-trip |
 
-**Still open (product / next work):** full JWT/project ACL on `/graph-audits` (flag + fixture gate only), harness tools/tracer wired into nodes, true mid-graph resume, multi-worker cancel/events.
+### Node governance wiring (2026-07-24)
+
+Harness tools / tracer / budget_manager are now consumed mid-run:
+
+- `GraphRuntime.tools` / `get_tools()` → `analyze_file` invokes allowlisted `heuristic_scan`
+- Node spans: `graph.node.*`, `tool.call`, `llm.call` via injected tracer
+- Graph `RunBudget` remains source of truth; harness `BudgetManager` mirrored via `_sync_budget_manager` (no double-count)
+- Tests: `test_analyze_uses_tool_registry_and_tracer`, harness e2e span/tool assertions
+
+**Still open (product / next work):** full JWT/project ACL on `/graph-audits` (flag + fixture gate only), true mid-graph resume, multi-worker cancel/events.
 
 ## Package map (new under `services/agent/`)
 
