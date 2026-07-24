@@ -5,10 +5,12 @@ Prefix: /api/v1/graph-audits
 These endpoints exercise GraphAuditFacade for dual-path validation.
 Production FE continues to use /api/v1/agent-tasks/* (ReAct).
 
-Trust boundary (Phase 0):
-- Feature flag GRAPH_AUDITS_ENABLED (default True for offline demos).
-- GRAPH_AUDITS_FIXTURE_ONLY (default True): reject client host ``local_path``;
-  only ``fixture_files`` (or server-side workspace via runtime, not client path).
+Trust boundary:
+- JWT required (same ``get_current_user`` as agent-tasks).
+- Per-audit ownership via ``AuditRequest.user_id`` on subsequent routes.
+- Feature flag GRAPH_AUDITS_ENABLED.
+- GRAPH_AUDITS_FIXTURE_ONLY: reject client host ``local_path``.
+- Optional GRAPH_AUDITS_ENFORCE_PROJECT_ACL for Project owner/member checks.
 - Always FakeLLM offline until ModelRouter is wired.
 """
 
@@ -16,11 +18,17 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
+from app.api import deps
 from app.core.config import settings
+from app.db.session import get_db
+from app.models.project import Project, ProjectMember
+from app.models.user import User
 from app.services.agent.application import GraphAuditFacade, get_graph_facade
 from app.services.agent.domain import AuditRequest, RepositoryRef, RunBudget
 from app.services.agent.graph.llm import FakeLLM
@@ -105,10 +113,62 @@ def _is_absolute_or_host_path(path: str) -> bool:
     return False
 
 
+async def _assert_project_access(
+    db: AsyncSession,
+    user: User,
+    project_id: Optional[str],
+) -> None:
+    """Optional DB project ACL (owner or member). No-op when flag off or no project_id."""
+    if not project_id:
+        return
+    if not bool(getattr(settings, "GRAPH_AUDITS_ENFORCE_PROJECT_ACL", False)):
+        return
+    project = await db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if getattr(user, "is_superuser", False):
+        return
+    if project.owner_id == user.id:
+        return
+    result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user.id,
+        )
+    )
+    member = result.scalars().first()
+    if member is None:
+        raise HTTPException(status_code=403, detail="无权访问此项目")
+
+
+async def _assert_audit_owner(task_id: str, user: User) -> dict[str, Any]:
+    """Load task and enforce creator ownership (user_id on AuditRequest)."""
+    task = await _facade().get_task(task_id)
+    if task is None:
+        raise HTTPException(404, "graph audit not found")
+    row = await _facade().runner.get(task_id)
+    owner_id: Optional[str] = None
+    if row is not None and row.request is not None:
+        owner_id = row.request.user_id
+    if owner_id is None:
+        # Legacy rows without user_id: deny when auth is required (fail closed).
+        raise HTTPException(status_code=403, detail="audit has no owner; access denied")
+    if getattr(user, "is_superuser", False):
+        return task
+    if owner_id != user.id:
+        raise HTTPException(status_code=403, detail="无权访问此审计任务")
+    return task
+
+
 @router.post("/")
-async def start_graph_audit(body: GraphAuditStartRequest) -> Any:
+async def start_graph_audit(
+    body: GraphAuditStartRequest,
+    current_user: User = Depends(deps.get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
     """Start a LangGraph audit (async by default; optional sync wait for tests)."""
     _ensure_enabled()
+    await _assert_project_access(db, current_user, body.project_id)
 
     fixture_files = dict(body.fixture_files or {})
     fixture_only = bool(getattr(settings, "GRAPH_AUDITS_FIXTURE_ONLY", True))
@@ -154,6 +214,7 @@ async def start_graph_audit(body: GraphAuditStartRequest) -> Any:
 
     req = AuditRequest(
         project_id=body.project_id,
+        user_id=str(current_user.id),
         repository=repo,
         title=body.name,
         languages=body.languages,
@@ -194,23 +255,31 @@ async def start_graph_audit(body: GraphAuditStartRequest) -> Any:
 
 
 @router.get("/{task_id}")
-async def get_graph_audit(task_id: str) -> dict[str, Any]:
+async def get_graph_audit(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+) -> dict[str, Any]:
     _ensure_enabled()
-    task = await _facade().get_task(task_id)
-    if task is None:
-        raise HTTPException(404, "graph audit not found")
-    return task
+    return await _assert_audit_owner(task_id, current_user)
 
 
 @router.post("/{task_id}/cancel")
-async def cancel_graph_audit(task_id: str) -> dict[str, Any]:
+async def cancel_graph_audit(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+) -> dict[str, Any]:
     _ensure_enabled()
+    await _assert_audit_owner(task_id, current_user)
     return await _facade().cancel(task_id)
 
 
 @router.post("/{task_id}/resume")
-async def resume_graph_audit(task_id: str) -> dict[str, Any]:
+async def resume_graph_audit(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+) -> dict[str, Any]:
     _ensure_enabled()
+    await _assert_audit_owner(task_id, current_user)
     try:
         return await _facade().resume(task_id, runtime=GraphRuntime(offline=True))
     except KeyError:
@@ -218,22 +287,31 @@ async def resume_graph_audit(task_id: str) -> dict[str, Any]:
 
 
 @router.get("/{task_id}/findings")
-async def list_graph_findings(task_id: str) -> list[dict[str, Any]]:
+async def list_graph_findings(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+) -> list[dict[str, Any]]:
     _ensure_enabled()
+    await _assert_audit_owner(task_id, current_user)
     return await _facade().list_findings(task_id)
 
 
 @router.get("/{task_id}/events")
-async def list_graph_events(task_id: str) -> list[dict[str, Any]]:
+async def list_graph_events(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+) -> list[dict[str, Any]]:
     _ensure_enabled()
+    await _assert_audit_owner(task_id, current_user)
     return await _facade().list_events(task_id)
 
 
 @router.post("/{task_id}/start")
-async def idempotent_start(task_id: str) -> dict[str, Any]:
+async def idempotent_start(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+) -> dict[str, Any]:
     """No-op/idempotent start for FE callers that POST .../start after create."""
     _ensure_enabled()
-    task = await _facade().get_task(task_id)
-    if task is None:
-        raise HTTPException(404, "graph audit not found")
+    task = await _assert_audit_owner(task_id, current_user)
     return {"id": task_id, "status": task.get("status"), "message": "already started"}

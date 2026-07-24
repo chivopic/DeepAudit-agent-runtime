@@ -140,98 +140,190 @@ async def test_facade_cancel_unknown_marks_cancelled():
     assert r["status"] == "cancelled"
 
 
+class _FakeUser:
+    """Minimal stand-in for models.user.User in dependency overrides."""
+
+    def __init__(self, uid: str = "user-test-1", *, superuser: bool = False) -> None:
+        self.id = uid
+        self.email = f"{uid}@example.com"
+        self.is_active = True
+        self.is_superuser = superuser
+
+
+def _override_auth(app, user: _FakeUser | None = None):
+    """Install get_current_user + get_db overrides; return cleanup callable."""
+    from app.api import deps
+    from app.db.session import get_db
+
+    fake = user or _FakeUser()
+
+    async def _user():
+        return fake
+
+    async def _db():
+        # Project ACL flag defaults off — DB is unused on happy path.
+        yield None
+
+    app.dependency_overrides[deps.get_current_user] = _user
+    app.dependency_overrides[get_db] = _db
+
+    def _cleanup() -> None:
+        app.dependency_overrides.pop(deps.get_current_user, None)
+        app.dependency_overrides.pop(get_db, None)
+
+    return _cleanup
+
+
 @pytest.mark.asyncio
-async def test_graph_audits_http_routes():
+async def test_graph_audits_requires_auth():
     from app.main import app
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Sync wait + fixture_files only (no client host path)
         resp = await client.post(
             "/api/v1/graph-audits/",
-            json={
-                "project_id": "p1",
-                "name": "http-demo",
-                "source_type": "local",
-                "offline": True,
-                "wait": True,
-                "fixture_files": FIXTURE,
-            },
+            json={"wait": True, "fixture_files": FIXTURE},
         )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] in {"completed", "partial"}
-        tid = body["id"]
+        assert resp.status_code in {401, 403}
 
-        g = await client.get(f"/api/v1/graph-audits/{tid}")
-        assert g.status_code == 200
-        assert g.json()["id"] == tid
 
-        f = await client.get(f"/api/v1/graph-audits/{tid}/findings")
-        assert f.status_code == 200
-        assert isinstance(f.json(), list)
+@pytest.mark.asyncio
+async def test_graph_audits_http_routes():
+    from app.main import app
 
-        e = await client.get(f"/api/v1/graph-audits/{tid}/events")
-        assert e.status_code == 200
-        assert len(e.json()) >= 1
+    cleanup = _override_auth(app)
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Sync wait + fixture_files only (no client host path)
+            resp = await client.post(
+                "/api/v1/graph-audits/",
+                json={
+                    "project_id": "p1",
+                    "name": "http-demo",
+                    "source_type": "local",
+                    "offline": True,
+                    "wait": True,
+                    "fixture_files": FIXTURE,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["status"] in {"completed", "partial"}
+            tid = body["id"]
 
-        s = await client.post(f"/api/v1/graph-audits/{tid}/start")
-        assert s.status_code == 200
-        assert "already" in s.json().get("message", "").lower() or s.json().get("status")
+            g = await client.get(f"/api/v1/graph-audits/{tid}")
+            assert g.status_code == 200
+            assert g.json()["id"] == tid
 
-        c = await client.post(f"/api/v1/graph-audits/{tid}/cancel")
-        assert c.status_code == 200
+            f = await client.get(f"/api/v1/graph-audits/{tid}/findings")
+            assert f.status_code == 200
+            assert isinstance(f.json(), list)
+
+            e = await client.get(f"/api/v1/graph-audits/{tid}/events")
+            assert e.status_code == 200
+            assert len(e.json()) >= 1
+
+            s = await client.post(f"/api/v1/graph-audits/{tid}/start")
+            assert s.status_code == 200
+            assert "already" in s.json().get("message", "").lower() or s.json().get(
+                "status"
+            )
+
+            c = await client.post(f"/api/v1/graph-audits/{tid}/cancel")
+            assert c.status_code == 200
+    finally:
+        cleanup()
+
+
+@pytest.mark.asyncio
+async def test_graph_audits_rejects_other_user():
+    from app.main import app
+
+    owner = _FakeUser("owner-1")
+    other = _FakeUser("intruder-2")
+    cleanup = _override_auth(app, owner)
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/graph-audits/",
+                json={
+                    "name": "owned",
+                    "wait": True,
+                    "fixture_files": FIXTURE,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            tid = resp.json()["id"]
+        cleanup()
+        cleanup = _override_auth(app, other)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            g = await client.get(f"/api/v1/graph-audits/{tid}")
+            assert g.status_code == 403
+            f = await client.get(f"/api/v1/graph-audits/{tid}/findings")
+            assert f.status_code == 403
+    finally:
+        cleanup()
 
 
 @pytest.mark.asyncio
 async def test_graph_audits_rejects_host_local_path():
     from app.main import app
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/v1/graph-audits/",
-            json={
-                "source_type": "local",
-                "local_path": "/etc/passwd",
-                "fixture_files": FIXTURE,
-                "wait": True,
-            },
-        )
-        assert resp.status_code == 400
-        assert "local_path" in resp.text.lower() or "fixture" in resp.text.lower()
+    cleanup = _override_auth(app)
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/graph-audits/",
+                json={
+                    "source_type": "local",
+                    "local_path": "/etc/passwd",
+                    "fixture_files": FIXTURE,
+                    "wait": True,
+                },
+            )
+            assert resp.status_code == 400
+            assert "local_path" in resp.text.lower() or "fixture" in resp.text.lower()
+    finally:
+        cleanup()
 
 
 @pytest.mark.asyncio
 async def test_graph_audits_async_accept_returns_202():
     from app.main import app
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/v1/graph-audits/",
-            json={
-                "project_id": "p-async",
-                "name": "bg",
-                "wait": False,
-                "fixture_files": FIXTURE,
-            },
-        )
-        assert resp.status_code == 202, resp.text
-        body = resp.json()
-        assert body["status"] == "pending"
-        tid = body["id"]
-        # Allow background task to finish
-        for _ in range(50):
-            g = await client.get(f"/api/v1/graph-audits/{tid}")
-            if g.status_code == 200 and g.json().get("status") in {
-                "completed",
-                "partial",
-                "failed",
-                "cancelled",
-            }:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            # Still pending is acceptable if event loop slow; cancel to clean up
-            await client.post(f"/api/v1/graph-audits/{tid}/cancel")
+    cleanup = _override_auth(app)
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/graph-audits/",
+                json={
+                    "project_id": "p-async",
+                    "name": "bg",
+                    "wait": False,
+                    "fixture_files": FIXTURE,
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            body = resp.json()
+            assert body["status"] == "pending"
+            tid = body["id"]
+            # Allow background task to finish
+            for _ in range(50):
+                g = await client.get(f"/api/v1/graph-audits/{tid}")
+                if g.status_code == 200 and g.json().get("status") in {
+                    "completed",
+                    "partial",
+                    "failed",
+                    "cancelled",
+                }:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                # Still pending is acceptable if event loop slow; cancel to clean up
+                await client.post(f"/api/v1/graph-audits/{tid}/cancel")
+    finally:
+        cleanup()

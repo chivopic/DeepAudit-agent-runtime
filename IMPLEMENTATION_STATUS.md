@@ -45,6 +45,7 @@ uv run pytest \
   -q
 # 2026-07-24 post Codex Phase 0/1: **128 passed**
 # 2026-07-24 node tools/tracer/budget wiring: **129 passed**
+# 2026-07-24 graph-audits JWT auth: **131 passed** (agent suite)
 ```
 
 ## Post-M11 audit hardening (same day)
@@ -79,7 +80,14 @@ Harness tools / tracer / budget_manager are now consumed mid-run:
 - Graph `RunBudget` remains source of truth; harness `BudgetManager` mirrored via `_sync_budget_manager` (no double-count)
 - Tests: `test_analyze_uses_tool_registry_and_tracer`, harness e2e span/tool assertions
 
-**Still open (product / next work):** full JWT/project ACL on `/graph-audits` (flag + fixture gate only), true mid-graph resume, multi-worker cancel/events.
+### Graph-audits JWT auth (2026-07-24)
+
+- All `/api/v1/graph-audits/*` routes require `deps.get_current_user` (parity with agent-tasks).
+- Start stamps `AuditRequest.user_id`; subsequent routes enforce owner (or superuser).
+- Optional `GRAPH_AUDITS_ENFORCE_PROJECT_ACL` (default False) checks Project owner/member when `project_id` set.
+- Tests: unauthenticated 401/403, owner happy path, cross-user 403.
+
+**Still open (product / next work):** true mid-graph resume, multi-worker cancel/events, Postgres business store adapter.
 
 ## Package map (new under `services/agent/`)
 

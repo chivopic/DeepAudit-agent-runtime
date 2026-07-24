@@ -34,8 +34,8 @@ Replace an implicit multi-agent ReAct stack with a **durable, protocol-driven** 
 1. **Context compaction mid-stream** — long sessions lost mid-implementation detail; recovered via status file + package map.
 2. **LangGraph config injection** — nodes often did not see `configurable.runtime`; fixed with `contextvar` (`set_runtime` / `get_runtime`).
 3. **Monolithic module files** — M8/M9/M11 landed as large `__init__.py` packages (workable but harder to review).
-4. **Harness / tooling not wired into graph nodes yet** — architecture present; analyze path still uses heuristics + FakeLLM only.
-5. **Experimental HTTP surface** — `/graph-audits` shipped without the same auth gates as production agent-tasks (called out below).
+4. **Harness / tooling not wired into graph nodes yet** — ~~architecture present only~~ **resolved 2026-07-24** (tools/tracer/budget mid-run).
+5. **Experimental HTTP surface** — ~~no auth~~ **JWT + owner ACL landed 2026-07-24** (optional project ACL flag).
 
 ### Lessons
 
@@ -244,8 +244,8 @@ Severity key: **C** critical · **H** high · **M** medium · **L** low
 
 ### What we did *not* change (intentionally)
 
-- Auth on `/graph-audits` (needs FE/product alignment)  
-- Full wiring of tools/tracer into graph nodes (next milestone-sized work)  
+- ~~Auth on `/graph-audits`~~ JWT + per-audit owner (optional project ACL flag)  
+- ~~Full wiring of tools/tracer into graph nodes~~ mid-run governance landed  
 - True multi-worker cancel / durable event bus  
 - Postgres checkpointer production cutover  
 
@@ -261,13 +261,13 @@ Confirmed Critical/High themes: unauth graph-audits + local_path LFI surface; ca
 | Area | Score | Notes |
 |------|-------|-------|
 | Architecture fit | 9/10 | Matches ADRs; dual-path correct |
-| Security defaults | 7/10 | Domain good; HTTP auth hole; harness not enforced in nodes |
+| Security defaults | 8/10 | JWT + owner on graph-audits; fixture-only; harness mid-run |
 | Testability | 9/10 | Deterministic suite solid |
 | Production readiness of LangGraph path | 4/10 | Experimental; FakeLLM; in-memory stores |
 | Code maintainability | 6/10 | Large modules; some brittle registry routing |
 | Docs / process | 9/10 | Status + implementation docs complete |
 
-**Bottom line:** The M0–M11 stack is a **sound skeleton** with the right boundaries and a strong deterministic test harness. It is **not** yet a drop-in production replacement for ReAct. Highest-value hardening: **auth on graph-audits**, **wire ToolRegistry/Tracer/Budget into nodes**, **true cancel/resume**, **Postgres adapters**.
+**Bottom line:** The M0–M11 stack is a **sound skeleton** with the right boundaries and a strong deterministic test harness. It is **not** yet a drop-in production replacement for ReAct. Highest-value remaining: **true mid-graph resume**, **multi-worker cancel/events**, **Postgres adapters**.
 
 ---
 
@@ -284,6 +284,8 @@ Codex second-pass findings implemented as **Phase 0/1**:
 | verification `SUCCEEDED` on skip | default + static/human/not_run paths use `ExecutionStatus.SKIPPED` |
 | Mapper field loss | `vulnerability_type` / `ai_confidence` / `is_verified` in from/to legacy |
 
-**Tests:** 128 passed (agent suite M1–M11 + Phase 0/1 cases).
+**Tests:** 128 → 129 (node wiring) → **131** (JWT auth) on agent suite M1–M11.
 
-Remaining product-gated: full JWT/project ACL on `/graph-audits`, harness enforcement in nodes, true mid-graph resume, multi-worker events.
+Post Phase 0/1 same-day: tools/tracer/budget node wiring; JWT + owner ACL on `/graph-audits` (optional `GRAPH_AUDITS_ENFORCE_PROJECT_ACL`).
+
+Remaining product-gated: true mid-graph resume, multi-worker events, Postgres business/checkpointer adapters.
