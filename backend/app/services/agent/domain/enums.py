@@ -11,6 +11,24 @@ class Severity(str, Enum):
     INFO = "info"
 
 
+class EvidenceLevel(str, Enum):
+    """Strength of deterministic evidence supporting a finding."""
+
+    E0 = "E0"  # Scanner signal only
+    E1 = "E1"  # Contextualized with relevant source context
+    E2 = "E2"  # Corroborated by independent deterministic evidence
+    E3 = "E3"  # Verified by controlled execution or explicit human review
+
+
+class FindingState(str, Enum):
+    """Triage lifecycle, independent from severity and verification status."""
+
+    CANDIDATE = "candidate"
+    TRIAGED = "triaged"
+    CORROBORATED = "corroborated"
+    VERIFIED = "verified"
+
+
 class VerificationStatus(str, Enum):
     """Whether a finding has been sandbox/tool verified."""
 

@@ -1,12 +1,10 @@
 """Phase 1 audit graph node implementations (skeleton with real domain I/O)."""
 
-from __future__ import annotations
-
 import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
@@ -111,7 +109,7 @@ def _node_span(runtime: GraphRuntime, node_name: str, **attrs: Any):
         return nullcontext()
 
 
-def _lang_for(path: str) -> Optional[str]:
+def _lang_for(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     return {
         ".py": "python",
@@ -132,7 +130,7 @@ def _lang_for(path: str) -> Optional[str]:
     }.get(ext)
 
 
-def _resolve_workspace(state: AuditState, runtime: GraphRuntime) -> Optional[Path]:
+def _resolve_workspace(state: AuditState, runtime: GraphRuntime) -> Path | None:
     if runtime.workspace_root:
         return Path(runtime.workspace_root)
     req = state.get("request")
@@ -152,7 +150,7 @@ def _resolve_workspace(state: AuditState, runtime: GraphRuntime) -> Optional[Pat
 # ---------------------------------------------------------------------------
 
 
-async def validate_request(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def validate_request(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Validate AuditRequest and normalize audit_id / status."""
     runtime = get_runtime(config)
     req = state.get("request")
@@ -208,7 +206,7 @@ async def validate_request(state: AuditState, config: Optional[RunnableConfig] =
     }
 
 
-async def ingest_repository(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def ingest_repository(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Snapshot repository metadata (local path or fixture map)."""
     runtime = get_runtime(config)
     req = state["request"]
@@ -218,7 +216,7 @@ async def ingest_repository(state: AuditState, config: Optional[RunnableConfig] 
     file_count = 0
     total_bytes = 0
     languages: set[str] = set()
-    snapshot_path: Optional[str] = None
+    snapshot_path: str | None = None
 
     if fixture_files:
         for p, content in fixture_files.items():
@@ -228,18 +226,28 @@ async def ingest_repository(state: AuditState, config: Optional[RunnableConfig] 
             if lang:
                 languages.add(lang)
         snapshot_path = "fixture://" + (state.get("audit_id") or "aud")
-    elif root and root.exists():
+    elif root and root.exists() and root.is_dir():
+        root = root.resolve(strict=True)
         snapshot_path = str(root)
         for path in root.rglob("*"):
-            if not path.is_file():
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
                 continue
-            if any(part in _SKIP_DIR_NAMES for part in path.parts):
+            if any(part in _SKIP_DIR_NAMES for part in rel.parts):
                 continue
             if path.suffix.lower() not in _SOURCE_EXTS:
                 continue
+            current = root
+            if any((current := current / part).is_symlink() for part in rel.parts):
+                continue
+            if not path.is_file():
+                continue
             try:
-                size = path.stat().st_size
-            except OSError:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root)
+                size = resolved.stat().st_size
+            except (OSError, ValueError):
                 continue
             file_count += 1
             total_bytes += size
@@ -274,7 +282,7 @@ async def ingest_repository(state: AuditState, config: Optional[RunnableConfig] 
     }
 
 
-async def build_manifest(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def build_manifest(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Build file inventory from workspace or fixtures."""
     runtime = get_runtime(config)
     req = state["request"]
@@ -294,9 +302,12 @@ async def build_manifest(state: AuditState, config: Optional[RunnableConfig] = N
 
     include = set(req.include_paths or [])
     exclude = set(req.exclude_paths or [])
+    requested_languages = {language.lower() for language in req.languages}
     files: list[FileArtifact] = []
     excluded: list[str] = []
+    manifest_issues: list[dict[str, str]] = []
     fixture_files: dict[str, str] = dict(runtime.extra.get("fixture_files") or {})
+    max_target_bytes = max(1, int(runtime.extra.get("scanner_max_target_bytes", 1 * 1024 * 1024)))
 
     def _allowed(rel: str) -> bool:
         if any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in exclude):
@@ -305,13 +316,39 @@ async def build_manifest(state: AuditState, config: Optional[RunnableConfig] = N
             return True
         return any(rel == i or rel.startswith(i.rstrip("/") + "/") for i in include)
 
+    def _source_allowed(rel: str) -> bool:
+        language = _lang_for(rel)
+        return Path(rel).suffix.lower() in _SOURCE_EXTS and (
+            not requested_languages or language in requested_languages
+        )
+
     if fixture_files:
         for rel, content in sorted(fixture_files.items()):
             rel_n = rel.replace("\\", "/")
-            if not _allowed(rel_n):
+            if not _allowed(rel_n) or not _source_allowed(rel_n):
                 excluded.append(rel_n)
                 continue
             raw = content.encode("utf-8")
+            if len(raw) > max_target_bytes:
+                excluded.append(rel_n)
+                manifest_issues.append(
+                    {
+                        "code": "target_too_large",
+                        "path": rel_n,
+                        "message": f"source file exceeds {max_target_bytes} bytes",
+                    }
+                )
+                continue
+            if b"\0" in raw[:8192]:
+                excluded.append(rel_n)
+                manifest_issues.append(
+                    {
+                        "code": "binary_file",
+                        "path": rel_n,
+                        "message": "binary source file was not scanned",
+                    }
+                )
+                continue
             files.append(
                 FileArtifact(
                     path=rel_n,
@@ -324,24 +361,87 @@ async def build_manifest(state: AuditState, config: Optional[RunnableConfig] = N
             )
     else:
         root = _resolve_workspace(state, runtime)
-        if root and root.exists():
+        if root and root.exists() and root.is_dir():
+            root = root.resolve(strict=True)
             for path in sorted(root.rglob("*")):
-                if not path.is_file():
-                    continue
-                if any(part in _SKIP_DIR_NAMES for part in path.parts):
-                    continue
-                if path.suffix.lower() not in _SOURCE_EXTS:
-                    continue
                 try:
                     rel = path.relative_to(root).as_posix()
                 except ValueError:
                     continue
-                if not _allowed(rel):
+                if any(part in _SKIP_DIR_NAMES for part in Path(rel).parts):
+                    continue
+                if not _allowed(rel) or not _source_allowed(rel):
                     excluded.append(rel)
                     continue
+                current = root
+                if any((current := current / part).is_symlink() for part in Path(rel).parts):
+                    excluded.append(rel)
+                    manifest_issues.append(
+                        {
+                            "code": "symlink",
+                            "path": rel,
+                            "message": "symbolic-link source file was not scanned",
+                        }
+                    )
+                    continue
+                if not path.is_file():
+                    continue
                 try:
-                    data = path.read_bytes()
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root)
+                except (OSError, ValueError):
+                    excluded.append(rel)
+                    manifest_issues.append(
+                        {
+                            "code": "unsafe_path",
+                            "path": rel,
+                            "message": "source file could not be resolved inside workspace",
+                        }
+                    )
+                    continue
+                try:
+                    size = resolved.stat().st_size
                 except OSError:
+                    excluded.append(rel)
+                    manifest_issues.append(
+                        {
+                            "code": "unreadable",
+                            "path": rel,
+                            "message": "source file metadata could not be read",
+                        }
+                    )
+                    continue
+                if size > max_target_bytes:
+                    excluded.append(rel)
+                    manifest_issues.append(
+                        {
+                            "code": "target_too_large",
+                            "path": rel,
+                            "message": f"source file exceeds {max_target_bytes} bytes",
+                        }
+                    )
+                    continue
+                try:
+                    data = resolved.read_bytes()
+                except OSError:
+                    excluded.append(rel)
+                    manifest_issues.append(
+                        {
+                            "code": "unreadable",
+                            "path": rel,
+                            "message": "source file could not be read",
+                        }
+                    )
+                    continue
+                if b"\0" in data[:8192]:
+                    excluded.append(rel)
+                    manifest_issues.append(
+                        {
+                            "code": "binary_file",
+                            "path": rel,
+                            "message": "binary source file was not scanned",
+                        }
+                    )
                     continue
                 files.append(
                     FileArtifact(
@@ -356,14 +456,24 @@ async def build_manifest(state: AuditState, config: Optional[RunnableConfig] = N
 
     # Cap by budget.max_files if set
     budget: RunBudget = state.get("budget") or req.budget
-    if budget.max_files > 0 and len(files) > budget.max_files:
+    discovered = len(files)
+    limited = budget.max_files > 0 and discovered > budget.max_files
+    if limited:
+        excluded.extend(file.path for file in files[budget.max_files :])
         files = files[: budget.max_files]
 
     manifest = RepositoryManifest(
         snapshot_id=snap.id,
         files=files,
         excluded_paths=excluded,
-        stats={"selected": len(files), "excluded": len(excluded)},
+        stats={
+            "selected": len(files),
+            "discovered": discovered,
+            "excluded": len(excluded),
+            "limited": limited,
+            "incomplete": bool(manifest_issues),
+            "issues": manifest_issues,
+        },
     )
     return {
         "manifest": manifest,
@@ -375,22 +485,151 @@ async def build_manifest(state: AuditState, config: Optional[RunnableConfig] = N
                 excluded=len(excluded),
             )
         ],
-        "meta": {"manifest_built": True},
+        "meta": {
+            "manifest_built": True,
+            "manifest_limited": limited,
+            "manifest_incomplete": bool(manifest_issues),
+            "manifest_issues": manifest_issues,
+        },
     }
 
 
-async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def static_scan(state: AuditState, config: RunnableConfig | None = None) -> dict:
+    """Run the injected scanner against the exact manifest and expose coverage."""
+    runtime = get_runtime(config)
+    scanner = runtime.scanner
+    if scanner is None:
+        return {
+            "events": [_event("node.completed", "static_scan not configured")],
+            "meta": {"scanner_configured": False},
+        }
+
+    manifest = state.get("manifest")
+    root = _resolve_workspace(state, runtime)
+    if manifest is None or root is None:
+        message = "scanner requires a manifest and local workspace"
+        return {
+            "errors": [
+                NodeError(
+                    code=NodeErrorCode.TOOL,
+                    node="static_scan",
+                    message=message,
+                )
+            ],
+            "events": [_event("node.failed", message)],
+            "meta": {
+                "scanner_configured": True,
+                "scanner_status": "error",
+                "scanner_coverage": {
+                    "status": "error",
+                    "requested_files": len(manifest.files) if manifest else 0,
+                    "scanned_files": 0,
+                },
+            },
+        }
+
+    try:
+        from app.services.agent.tooling.scanners import ScannerRequest
+
+        result = await scanner.scan(
+            ScannerRequest(
+                workspace_root=Path(root).resolve(strict=True),
+                relative_files=tuple(manifest.paths()),
+                max_results=int(runtime.extra.get("scanner_max_results", 2_000)),
+                max_target_bytes=int(
+                    runtime.extra.get("scanner_max_target_bytes", 1 * 1024 * 1024)
+                ),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — normalized into explicit scanner failure
+        message = f"scanner failed: {type(exc).__name__}: {exc}"
+        return {
+            "errors": [
+                NodeError(
+                    code=NodeErrorCode.TOOL,
+                    node="static_scan",
+                    message=message,
+                )
+            ],
+            "events": [_event("node.failed", message)],
+            "meta": {
+                "scanner_configured": True,
+                "scanner_status": "error",
+                "scanner_coverage": {
+                    "status": "error",
+                    "requested_files": len(manifest.files),
+                    "scanned_files": 0,
+                },
+            },
+        }
+
+    status = result.status.value
+    issue_dicts = [issue.to_dict() for issue in result.issues]
+    event_kind = "node.completed" if status == "complete" else "node.partial"
+    if status == "error":
+        event_kind = "node.failed"
+    errors = []
+    if status == "error":
+        errors.append(
+            NodeError(
+                code=NodeErrorCode.TOOL,
+                node="static_scan",
+                message="static scanner returned an error result",
+                details={"issues": issue_dicts},
+            )
+        )
+    budget = state.get("budget")
+    budget_update = budget
+    if (
+        budget is not None
+        and not runtime.enable_model_calls
+        and not runtime.enable_heuristic_analysis
+    ):
+        budget_update = budget.model_copy(
+            update={"files_analyzed": budget.files_analyzed + result.scanned_files}
+        )
+        _sync_budget_manager(runtime, budget_update)
+    return {
+        "candidate_findings": list(result.candidates),
+        "budget": budget_update,
+        "errors": errors,
+        "events": [
+            _event(
+                event_kind,
+                f"static_scan {status}",
+                scanner=result.scanner,
+                requested_files=result.requested_files,
+                scanned_files=result.scanned_files,
+                candidates=len(result.candidates),
+            )
+        ],
+        "meta": {
+            "scanner_configured": True,
+            "scanner_status": status,
+            "scanner_coverage": result.coverage_dict(),
+            "scanner_issues": issue_dicts,
+            "scanner_metadata": dict(result.metadata),
+        },
+    }
+
+
+async def plan_audit(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Create an AuditPlan — FakeLLM optional structured assist, then deterministic plan."""
     runtime = get_runtime(config)
     req = state["request"]
     manifest = state.get("manifest")
-    if manifest is None or not manifest.files:
+    scanner_only = not runtime.enable_model_calls and not runtime.enable_heuristic_analysis
+    if manifest is None or not manifest.files or scanner_only:
         # Empty plan is valid (no files)
         plan = AuditPlan(
             audit_id=state["audit_id"],
             tasks=[],
             strategy="file_parallel",
-            rationale="no files in manifest",
+            rationale=(
+                "static scanner is the complete analysis plan"
+                if scanner_only and manifest and manifest.files
+                else "no files in manifest"
+            ),
         )
         return {
             "status": AuditStatus.PLANNING,
@@ -404,30 +643,29 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
     rationale = "priority by path heuristics"
     with _node_span(runtime, "plan_audit", **{"audit.id": state.get("audit_id")}):
         # Optional LLM call (FakeLLM in tests) — counts against budget
-        try:
-            resp = await runtime.llm.complete(
-                [
-                    LLMMessage(
-                        role="system", content="You plan security audits. Reply JSON."
-                    ),
-                    LLMMessage(
-                        role="user",
-                        content=json.dumps(
-                            {
-                                "files": [f.path for f in manifest.files[:50]],
-                                "languages": req.languages,
-                            }
+        if runtime.enable_model_calls:
+            try:
+                resp = await runtime.llm.complete(
+                    [
+                        LLMMessage(role="system", content="You plan security audits. Reply JSON."),
+                        LLMMessage(
+                            role="user",
+                            content=json.dumps(
+                                {
+                                    "files": [f.path for f in manifest.files[:50]],
+                                    "languages": req.languages,
+                                }
+                            ),
                         ),
-                    ),
-                ]
-            )
-            usage = usage.add(resp.usage)
-            tokens = resp.usage.total_tokens or 0
-            budget = budget.consume_model_call(tokens=tokens)
-            if resp.content:
-                rationale = f"llm:{resp.content[:200]}"
-        except Exception as exc:  # noqa: BLE001 — planner must not fail hard
-            logger.warning("plan_audit llm failed: %s", exc)
+                    ]
+                )
+                usage = usage.add(resp.usage)
+                tokens = resp.usage.total_tokens or 0
+                budget = budget.consume_model_call(tokens=tokens)
+                if resp.content:
+                    rationale = f"llm:{resp.content[:200]}"
+            except Exception as exc:  # noqa: BLE001 — planner must not fail hard
+                logger.warning("plan_audit llm failed: %s", exc)
 
         tasks: list[AuditTaskSpec] = []
         for f in manifest.files:
@@ -435,7 +673,13 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
                 AuditTaskSpec(
                     target_path=f.path,
                     language=f.language,
-                    analyzer="llm" if runtime.offline else "hybrid",
+                    analyzer=(
+                        "llm"
+                        if runtime.enable_model_calls and runtime.offline
+                        else "hybrid"
+                        if runtime.enable_model_calls
+                        else "static"
+                    ),
                     priority=f.priority,
                     max_tokens=min(4000, budget.remaining_tokens() or 4000),
                 )
@@ -458,9 +702,7 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
         "pending_task_ids": [t.id for t in tasks],
         "usage": usage,
         "budget": budget,
-        "events": [
-            _event("node.completed", "plan_audit", task_count=len(tasks))
-        ],
+        "events": [_event("node.completed", "plan_audit", task_count=len(tasks))],
         "meta": {"planned": True},
     }
 
@@ -537,9 +779,7 @@ def _safe_read_under_root(root: Path, rel: str) -> str:
     return ""
 
 
-async def finalize_cancelled(
-    state: AuditState, config: Optional[RunnableConfig] = None
-) -> dict:
+async def finalize_cancelled(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Terminal node when cooperative cancel is observed."""
     return {
         "status": AuditStatus.CANCELLED,
@@ -555,7 +795,7 @@ async def finalize_cancelled(
     }
 
 
-async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def analyze_file(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Analyze the next pending task; emit candidate findings.
 
     When ``GraphRuntime.tools`` is set, runs allowlisted ``heuristic_scan`` /
@@ -625,11 +865,17 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
             if root:
                 content = _safe_read_under_root(Path(root), task.target_path)
 
-        candidates = _heuristic_candidates(task, content)
+        candidates = (
+            _heuristic_candidates(task, content) if runtime.enable_heuristic_analysis else []
+        )
         usage = state.get("usage") or ModelUsage()
 
         # Optional ToolRegistry: allowlisted heuristic_scan
-        tools = runtime.get_tools() if hasattr(runtime, "get_tools") else None
+        tools = (
+            runtime.get_tools()
+            if runtime.enable_heuristic_analysis and hasattr(runtime, "get_tools")
+            else None
+        )
         if tools is not None and not budget.tool_calls_exhausted():
             try:
                 from contextlib import nullcontext
@@ -694,90 +940,90 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
                             )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("analyze_file tool invoke failed: %s", exc)
-                tool_events.append(
-                    _event("tool.error", str(exc)[:200], path=task.target_path)
-                )
+                tool_events.append(_event("tool.error", str(exc)[:200], path=task.target_path))
 
         # Fake / real LLM enrichment
-        try:
-            from contextlib import nullcontext
+        if runtime.enable_model_calls:
+            try:
+                from contextlib import nullcontext
 
-            from app.services.agent.observability import SPAN_LLM_CALL
+                from app.services.agent.observability import SPAN_LLM_CALL
 
-            tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
-            llm_cm = (
-                tracer.span(
-                    SPAN_LLM_CALL, **{"path": task.target_path, "node": "analyze_file"}
+                tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
+                llm_cm = (
+                    tracer.span(
+                        SPAN_LLM_CALL,
+                        **{"path": task.target_path, "node": "analyze_file"},
+                    )
+                    if tracer is not None
+                    else nullcontext()
                 )
-                if tracer is not None
-                else nullcontext()
-            )
-            with llm_cm:
-                resp = await runtime.llm.complete(
-                    [
-                        LLMMessage(
-                            role="system",
-                            content=(
-                                "Return JSON array of findings "
-                                "[{title,description,severity,line}]."
-                            ),
-                        ),
-                        LLMMessage(
-                            role="user",
-                            content=json.dumps(
-                                {
-                                    "path": task.target_path,
-                                    "content": content[:4000],
-                                }
-                            ),
-                        ),
-                    ]
-                )
-            usage = usage.add(resp.usage)
-            tokens = resp.usage.total_tokens or 0
-            budget = budget.consume_model_call(tokens=tokens)
-            # Parse optional structured findings from FakeLLM
-            text = (resp.content or "").strip()
-            if text.startswith("["):
-                try:
-                    arr = json.loads(text)
-                    for item in arr:
-                        line = int(item.get("line") or 1)
-                        loc = SourceLocation(
-                            file_path=task.target_path,
-                            start_line=line,
-                            end_line=line,
-                        )
-                        sev_raw = str(item.get("severity") or "medium").lower()
-                        try:
-                            sev = Severity(sev_raw)
-                        except ValueError:
-                            sev = Severity.MEDIUM
-                        candidates.append(
-                            CandidateFinding(
-                                title=str(item.get("title") or "LLM finding"),
-                                description=str(
-                                    item.get("description") or item.get("title") or ""
+                with llm_cm:
+                    resp = await runtime.llm.complete(
+                        [
+                            LLMMessage(
+                                role="system",
+                                content=(
+                                    "Return JSON array of findings "
+                                    "[{title,description,severity,line}]."
                                 ),
-                                severity=sev,
-                                location=loc,
-                                evidence=[
-                                    Evidence(
-                                        kind="model",
-                                        summary="llm candidate",
-                                        location=loc,
-                                        confidence=0.55,
-                                    )
-                                ],
-                                confidence=0.55,
-                                analyzer="llm",
-                                source_task_id=task.id,
+                            ),
+                            LLMMessage(
+                                role="user",
+                                content=json.dumps(
+                                    {
+                                        "path": task.target_path,
+                                        "content": content[:4000],
+                                    }
+                                ),
+                            ),
+                        ]
+                    )
+                usage = usage.add(resp.usage)
+                tokens = resp.usage.total_tokens or 0
+                budget = budget.consume_model_call(tokens=tokens)
+                # Parse optional structured findings from FakeLLM
+                text = (resp.content or "").strip()
+                if text.startswith("["):
+                    try:
+                        arr = json.loads(text)
+                        for item in arr:
+                            line = int(item.get("line") or 1)
+                            loc = SourceLocation(
+                                file_path=task.target_path,
+                                start_line=line,
+                                end_line=line,
                             )
-                        )
-                except json.JSONDecodeError:
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("analyze_file llm failed: %s", exc)
+                            sev_raw = str(item.get("severity") or "medium").lower()
+                            try:
+                                sev = Severity(sev_raw)
+                            except ValueError:
+                                sev = Severity.MEDIUM
+                            candidates.append(
+                                CandidateFinding(
+                                    title=str(item.get("title") or "LLM finding"),
+                                    description=str(
+                                        item.get("description") or item.get("title") or ""
+                                    ),
+                                    severity=sev,
+                                    location=loc,
+                                    evidence=[
+                                        Evidence(
+                                            kind="model",
+                                            summary="llm candidate",
+                                            location=loc,
+                                            confidence=0.55,
+                                        )
+                                    ],
+                                    confidence=0.55,
+                                    analyzer="llm",
+                                    source_task_id=task.id,
+                                )
+                            )
+                    except json.JSONDecodeError:
+                        pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("analyze_file llm failed: %s", exc)
 
         budget = budget.consume_file()
         _sync_budget_manager(runtime, budget)
@@ -802,7 +1048,7 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
     }
 
 
-async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def aggregate_findings(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Normalize candidates into Finding list; drop evidence-less items."""
     candidates = list(state.get("candidate_findings") or [])
     normalized: list[Finding] = []
@@ -813,6 +1059,7 @@ async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig]
             continue
         normalized.append(
             Finding(
+                id=f"fnd_{c.fingerprint[:12]}" if c.fingerprint else c.id,
                 audit_id=state.get("audit_id"),
                 title=c.title,
                 description=c.description,
@@ -824,6 +1071,9 @@ async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig]
                 owasp=c.owasp,
                 location=c.location,
                 evidence=list(c.evidence),
+                counter_evidence=list(c.counter_evidence),
+                evidence_level=c.evidence_level,
+                finding_state=c.finding_state,
                 confidence=c.confidence,
                 analyzer=c.analyzer,
                 rule_id=c.rule_id,
@@ -845,7 +1095,7 @@ async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig]
     }
 
 
-async def deduplicate_findings(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def deduplicate_findings(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Dedupe by path + line + title/rule fingerprint."""
     from app.services.agent.domain.mappers import fingerprint_components
 
@@ -892,7 +1142,7 @@ _SEV_RANK = {
 }
 
 
-async def prioritize_findings(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def prioritize_findings(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Sort findings by severity then confidence; assign risk_score."""
     findings = list(state.get("normalized_findings") or [])
     ranked: list[Finding] = []
@@ -907,13 +1157,11 @@ async def prioritize_findings(state: AuditState, config: Optional[RunnableConfig
     )
     return {
         "normalized_findings": ranked,
-        "events": [
-            _event("node.completed", "prioritize_findings", count=len(ranked))
-        ],
+        "events": [_event("node.completed", "prioritize_findings", count=len(ranked))],
     }
 
 
-async def generate_report(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
+async def generate_report(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Build AuditReport with explicit Phase-1 NOT_RUN verification note."""
     runtime = get_runtime(config)
     if runtime.is_cancelled() or state.get("cancelled"):
@@ -930,23 +1178,35 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
             f = f.with_verification(VerificationStatus.NOT_RUN)
         final_findings.append(f)
 
-    not_run = sum(
-        1
-        for f in final_findings
-        if f.verification_status is VerificationStatus.NOT_RUN
-    )
+    not_run = sum(1 for f in final_findings if f.verification_status is VerificationStatus.NOT_RUN)
     budget = state.get("budget")
     pending = list(state.get("pending_task_ids") or [])
     plan = state.get("plan")
     planned = len(plan.tasks) if plan is not None else 0
     budget_hit = bool(budget is not None and budget.is_exhausted())
-    incomplete = bool(pending) or (
-        budget_hit and planned > 0 and (budget.files_analyzed if budget else 0) < planned
+    meta = dict(state.get("meta") or {})
+    scanner_status = meta.get("scanner_status")
+    scanner_incomplete = scanner_status in {"partial", "error"}
+    manifest_limited = bool(meta.get("manifest_limited"))
+    manifest_incomplete = bool(meta.get("manifest_incomplete"))
+    incomplete = (
+        bool(pending)
+        or scanner_incomplete
+        or manifest_limited
+        or manifest_incomplete
+        or (budget_hit and planned > 0 and (budget.files_analyzed if budget else 0) < planned)
     )
-    terminal = AuditStatus.PARTIAL if incomplete else AuditStatus.COMPLETED
+    strict = bool(state["request"].config.get("strict"))
+    terminal = (
+        AuditStatus.FAILED
+        if strict and scanner_status == "error"
+        else AuditStatus.PARTIAL
+        if incomplete
+        else AuditStatus.COMPLETED
+    )
     if incomplete:
         summary = (
-            f"Audit partial ({terminal.value}): budget or scope limited run with "
+            f"Audit incomplete ({terminal.value}): scanner, budget, or scope limited run with "
             f"{len(final_findings)} finding(s); "
             f"{len(pending)} task(s) remaining. "
             f"Phase 1: {not_run} finding(s) have verification_status=not_run."
@@ -978,7 +1238,7 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
             title="Verification gaps",
             body_markdown=(
                 "Sandbox verification was **not run** in this phase. "
-                "Treat all results as unverified static/LLM signals."
+                "Treat all results as unverified analysis signals."
             ),
             order=2,
         ),
@@ -995,6 +1255,12 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
         metadata={
             "budget_exhausted": budget_hit,
             "pending_task_ids": pending,
+            "manifest_limited": manifest_limited,
+            "manifest_incomplete": manifest_incomplete,
+            "manifest_issues": meta.get("manifest_issues", []),
+            "scanner_status": scanner_status,
+            "scanner_coverage": meta.get("scanner_coverage"),
+            "scanner_issues": meta.get("scanner_issues", []),
         },
     ).recount_severities()
 
@@ -1012,5 +1278,10 @@ async def generate_report(state: AuditState, config: Optional[RunnableConfig] = 
                 budget_exhausted=budget_hit,
             )
         ],
-        "meta": {"budget_exhausted": budget_hit, "terminal_status": terminal.value},
+        "meta": {
+            "budget_exhausted": budget_hit,
+            "terminal_status": terminal.value,
+            "manifest_limited": manifest_limited,
+            "manifest_incomplete": manifest_incomplete,
+        },
     }

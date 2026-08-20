@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -18,7 +18,7 @@ def build_audit_graph() -> StateGraph:
     Flow::
 
         START → validate_request → ingest_repository → build_manifest
-              → plan_audit → analyze_file* → aggregate_findings
+              → static_scan → plan_audit → analyze_file* → aggregate_findings
               → deduplicate_findings → prioritize_findings
               → generate_report → END
     """
@@ -27,6 +27,7 @@ def build_audit_graph() -> StateGraph:
     g.add_node("validate_request", nodes.validate_request)
     g.add_node("ingest_repository", nodes.ingest_repository)
     g.add_node("build_manifest", nodes.build_manifest)
+    g.add_node("static_scan", nodes.static_scan)
     g.add_node("plan_audit", nodes.plan_audit)
     g.add_node("analyze_file", nodes.analyze_file)
     g.add_node("aggregate_findings", nodes.aggregate_findings)
@@ -52,7 +53,8 @@ def build_audit_graph() -> StateGraph:
             "__end__": END,
         },
     )
-    g.add_edge("build_manifest", "plan_audit")
+    g.add_edge("build_manifest", "static_scan")
+    g.add_edge("static_scan", "plan_audit")
     g.add_edge("plan_audit", "analyze_file")
     g.add_conditional_edges(
         "analyze_file",

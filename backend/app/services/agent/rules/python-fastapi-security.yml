@@ -1,0 +1,60 @@
+rules:
+  - id: deepaudit.python.dangerous-eval
+    languages: [python]
+    message: Avoid eval() or exec() on data that may be influenced by an attacker.
+    severity: ERROR
+    metadata:
+      title: Dynamic Code Evaluation
+      category: code_injection
+      cwe: ["CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"]
+      confidence: HIGH
+    pattern-either:
+      - pattern: eval($EXPRESSION)
+      - pattern: exec($EXPRESSION)
+
+  - id: deepaudit.python.subprocess-shell-true
+    languages: [python]
+    message: subprocess with shell=True can enable command injection when arguments are attacker-controlled.
+    severity: ERROR
+    metadata:
+      title: Shell Command Execution
+      category: command_injection
+      cwe: ["CWE-78: Improper Neutralization of Special Elements used in an OS Command"]
+      confidence: HIGH
+    pattern: subprocess.$METHOD(..., shell=True, ...)
+
+  - id: deepaudit.python.pickle-deserialization
+    languages: [python]
+    message: Deserializing untrusted pickle data can execute arbitrary code.
+    severity: ERROR
+    metadata:
+      title: Unsafe Pickle Deserialization
+      category: insecure_deserialization
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+      confidence: HIGH
+    pattern-either:
+      - pattern: pickle.load($FILE, ...)
+      - pattern: pickle.loads($DATA, ...)
+
+  - id: deepaudit.python.tls-verification-disabled
+    languages: [python]
+    message: TLS certificate verification is disabled for this HTTP request.
+    severity: WARNING
+    metadata:
+      title: TLS Verification Disabled
+      category: transport_security
+      cwe: ["CWE-295: Improper Certificate Validation"]
+      confidence: HIGH
+    pattern: requests.$METHOD(..., verify=False, ...)
+
+  - id: deepaudit.fastapi.cors-wildcard-with-credentials
+    languages: [python]
+    message: Credentialed CORS combined with a wildcard origin is unsafe and may expose authenticated data.
+    severity: ERROR
+    metadata:
+      title: Unsafe Credentialed CORS
+      category: security_misconfiguration
+      cwe: ["CWE-942: Permissive Cross-domain Policy with Untrusted Domains"]
+      confidence: HIGH
+    patterns:
+      - pattern: $APP.add_middleware(CORSMiddleware, ..., allow_origins=["*"], ..., allow_credentials=True, ...)

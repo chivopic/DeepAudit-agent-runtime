@@ -8,8 +8,9 @@ enforced here before/around graph invocation.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -37,9 +38,11 @@ class AgentSpec(BaseModel):
     model: str = "fake-model"
     provider: str = "fake"
     offline: bool = True
+    enable_model_calls: bool = True
+    enable_heuristic_analysis: bool = True
     allow_execution: bool = False
     max_parallel_analyzers: int = Field(default=5, ge=1, le=32)
-    tool_allowlist: Optional[list[str]] = None
+    tool_allowlist: list[str] | None = None
     budget: RunBudget = Field(default_factory=RunBudget)
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -61,10 +64,10 @@ class ToolRouter:
     """Builds a ToolRegistry from AgentSpec allowlist."""
 
     files: dict[str, str] = field(default_factory=dict)
-    extra: Optional[ToolProtocol] = None
+    extra: ToolProtocol | None = None
 
     def resolve(self, spec: AgentSpec) -> ToolRegistry:
-        allow = set(spec.tool_allowlist) if spec.tool_allowlist else None
+        allow = set(spec.tool_allowlist) if spec.tool_allowlist is not None else None
         reg = default_tool_registry(files=self.files)
         if allow is not None:
             reg.allowlist = allow
@@ -125,14 +128,17 @@ class AgentRuntime:
     def __init__(
         self,
         *,
-        spec: Optional[AgentSpec] = None,
-        runner: Optional[AuditRunner] = None,
-        model_router: Optional[ModelRouter] = None,
-        tool_router: Optional[ToolRouter] = None,
-        context_policy: Optional[ContextPolicy] = None,
-        permission_policy: Optional[PermissionPolicy] = None,
-        tracer: Optional[Tracer] = None,
-        bus: Optional[GraphEventBus] = None,
+        spec: AgentSpec | None = None,
+        runner: AuditRunner | None = None,
+        model_router: ModelRouter | None = None,
+        tool_router: ToolRouter | None = None,
+        context_policy: ContextPolicy | None = None,
+        permission_policy: PermissionPolicy | None = None,
+        tracer: Tracer | None = None,
+        bus: GraphEventBus | None = None,
+        scanner: Any | None = None,
+        workspace_root: Any | None = None,
+        runtime_extra: dict[str, Any] | None = None,
     ) -> None:
         self.spec = spec or AgentSpec()
         self.runner = runner or AuditRunner()
@@ -141,14 +147,15 @@ class AgentRuntime:
         self.context_policy = context_policy or ContextPolicy()
         # Hard gate defaults closed; do NOT mirror AgentSpec.allow_execution here.
         # Callers must pass an explicit PermissionPolicy to opt into execution.
-        self.permission_policy = permission_policy or PermissionPolicy(
-            allow_execution=False
-        )
+        self.permission_policy = permission_policy or PermissionPolicy(allow_execution=False)
         self.tracer = tracer or get_tracer()
         self.bus = bus or get_graph_event_bus()
+        self.scanner = scanner
+        self.workspace_root = workspace_root
+        self.runtime_extra = dict(runtime_extra or {})
         self.budget_manager = BudgetManager.from_spec(self.spec)
-        self._last_result: Optional[AuditRunResult] = None
-        self._tools: Optional[ToolRegistry] = None
+        self._last_result: AuditRunResult | None = None
+        self._tools: ToolRegistry | None = None
 
     @property
     def tools(self) -> ToolRegistry:
@@ -161,7 +168,11 @@ class AgentRuntime:
         tools = self.tools
         return GraphRuntime(
             llm=llm,
+            workspace_root=self.workspace_root,
+            scanner=self.scanner,
             offline=self.spec.offline,
+            enable_model_calls=self.spec.enable_model_calls,
+            enable_heuristic_analysis=self.spec.enable_heuristic_analysis,
             tools=tools,
             tracer=self.tracer,
             budget_manager=self.budget_manager,
@@ -171,6 +182,7 @@ class AgentRuntime:
                 "tracer": self.tracer,
                 "budget_manager": self.budget_manager,
                 **({"fixture_files": self.tool_router.files} if self.tool_router.files else {}),
+                **self.runtime_extra,
             },
         )
 
@@ -229,20 +241,33 @@ class AgentRuntime:
         async for ev in self.bus.subscribe(audit_id):
             yield ev
 
-    def last_result(self) -> Optional[AuditRunResult]:
+    def last_result(self) -> AuditRunResult | None:
         return self._last_result
 
 
 def default_runtime(
     *,
     offline: bool = True,
-    files: Optional[dict[str, str]] = None,
+    files: dict[str, str] | None = None,
     allow_execution: bool = False,
+    scanner: Any | None = None,
+    workspace_root: Any | None = None,
+    enable_model_calls: bool = True,
+    enable_heuristic_analysis: bool = True,
+    runtime_extra: dict[str, Any] | None = None,
 ) -> AgentRuntime:
     """Factory for Phase-1 governed runtime (FakeLLM + NullSandbox path)."""
-    spec = AgentSpec(offline=offline, allow_execution=allow_execution)
+    spec = AgentSpec(
+        offline=offline,
+        allow_execution=allow_execution,
+        enable_model_calls=enable_model_calls,
+        enable_heuristic_analysis=enable_heuristic_analysis,
+    )
     return AgentRuntime(
         spec=spec,
         tool_router=ToolRouter(files=dict(files or {})),
         permission_policy=PermissionPolicy(allow_execution=allow_execution),
+        scanner=scanner,
+        workspace_root=workspace_root,
+        runtime_extra=runtime_extra,
     )

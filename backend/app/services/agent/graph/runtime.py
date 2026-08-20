@@ -5,13 +5,11 @@ from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 from .llm import FakeLLM, LLMGateway
 
-_runtime_ctx: ContextVar[Optional["GraphRuntime"]] = ContextVar(
-    "deepaudit_graph_runtime", default=None
-)
+_runtime_ctx: ContextVar[GraphRuntime | None] = ContextVar("deepaudit_graph_runtime", default=None)
 
 
 @dataclass
@@ -23,18 +21,23 @@ class GraphRuntime:
     """
 
     llm: LLMGateway = field(default_factory=FakeLLM)
-    workspace_root: Optional[Path] = None
+    workspace_root: Path | None = None
+    # ScannerProtocol | None — injected static-analysis boundary.
+    scanner: Any | None = None
     # When True, analyze/plan use FakeLLM scripted payloads only.
     offline: bool = True
+    # Keep legacy graph behavior by default; CLI-1 disables both explicitly.
+    enable_model_calls: bool = True
+    enable_heuristic_analysis: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
     # Cooperative cancel: runner sets this; nodes poll via is_cancelled().
-    cancel_check: Optional[Any] = None  # Callable[[], bool]
+    cancel_check: Any | None = None  # Callable[[], bool]
     # ToolRegistry | None — allowlisted tools for analyze nodes
-    tools: Optional[Any] = None
+    tools: Any | None = None
     # Tracer | None — observability; falls back to get_tracer() if unset
-    tracer: Optional[Any] = None
+    tracer: Any | None = None
     # BudgetManager | None — harness-level budget mirror (optional)
-    budget_manager: Optional[Any] = None
+    budget_manager: Any | None = None
 
     def is_cancelled(self) -> bool:
         fn = self.cancel_check
@@ -73,7 +76,7 @@ def reset_runtime(token) -> None:
     _runtime_ctx.reset(token)
 
 
-def get_runtime(config: Optional[Union[dict, Any]] = None) -> GraphRuntime:
+def get_runtime(config: dict | Any | None = None) -> GraphRuntime:
     """Extract GraphRuntime from LangGraph RunnableConfig or contextvar."""
     # 1) Explicit argument
     rt = _from_config(config)
@@ -95,7 +98,7 @@ def get_runtime(config: Optional[Union[dict, Any]] = None) -> GraphRuntime:
     return GraphRuntime()
 
 
-def _from_config(cfg: Any) -> Optional[GraphRuntime]:
+def _from_config(cfg: Any) -> GraphRuntime | None:
     if not cfg:
         return None
     configurable: Any = None

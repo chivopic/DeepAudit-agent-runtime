@@ -10,44 +10,57 @@ These Pydantic models are the single source of truth for:
 ORM models remain under ``app.models``; map at the application boundary.
 """
 
+from .audit import AuditReport, AuditReportSection, AuditRequest
+from .cli import (
+    CliAuditEnvelope,
+    CliAuditSummary,
+    CliFindingView,
+    CliScope,
+    DoctorCheck,
+    DoctorEnvelope,
+)
+from .common import ArtifactRef, ModelUsage, NodeError, RunBudget, SourceLocation
 from .enums import (
+    ArtifactKind,
     AuditStatus,
+    EvidenceLevel,
+    ExecutionStatus,
+    FindingState,
     FindingStatus,
+    NodeErrorCode,
     Severity,
     VerificationStatus,
-    ExecutionStatus,
-    ArtifactKind,
-    NodeErrorCode,
 )
-from .common import ArtifactRef, SourceLocation, ModelUsage, NodeError, RunBudget
-from .repository import (
-    RepositoryRef,
-    RepositorySnapshot,
-    FileArtifact,
-    RepositoryManifest,
-)
-from .plan import AuditTaskSpec, AuditPlan
 from .finding import (
-    Evidence,
     CandidateFinding,
+    Evidence,
     Finding,
+    ReasoningArtifact,
     VerifiedFinding,
 )
-from .verification import (
-    VerificationRequest,
-    VerificationResult,
-    FixProposal,
-)
-from .audit import AuditRequest, AuditReport, AuditReportSection
 from .mappers import (
     finding_from_legacy_dict,
     finding_to_legacy_dict,
     fingerprint_components,
 )
+from .plan import AuditPlan, AuditTaskSpec
+from .repository import (
+    FileArtifact,
+    RepositoryManifest,
+    RepositoryRef,
+    RepositorySnapshot,
+)
+from .verification import (
+    FixProposal,
+    VerificationRequest,
+    VerificationResult,
+)
 
 __all__ = [
     # enums
     "AuditStatus",
+    "EvidenceLevel",
+    "FindingState",
     "FindingStatus",
     "Severity",
     "VerificationStatus",
@@ -60,6 +73,13 @@ __all__ = [
     "ModelUsage",
     "NodeError",
     "RunBudget",
+    # CLI result contracts
+    "CliAuditEnvelope",
+    "CliAuditSummary",
+    "CliFindingView",
+    "CliScope",
+    "DoctorCheck",
+    "DoctorEnvelope",
     # repository
     "RepositoryRef",
     "RepositorySnapshot",
@@ -72,6 +92,7 @@ __all__ = [
     "Evidence",
     "CandidateFinding",
     "Finding",
+    "ReasoningArtifact",
     "VerifiedFinding",
     # verification
     "VerificationRequest",

@@ -10,12 +10,17 @@ Compatibility notes (freeze list):
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Optional
+from typing import Any
 
-from .enums import FindingStatus, Severity, VerificationStatus
-from .finding import Evidence, Finding
 from .common import SourceLocation
-
+from .enums import (
+    EvidenceLevel,
+    FindingState,
+    FindingStatus,
+    Severity,
+    VerificationStatus,
+)
+from .finding import Evidence, Finding
 
 _SEVERITY_ALIASES = {
     "crit": Severity.CRITICAL,
@@ -71,13 +76,31 @@ def _parse_verification_status(value: Any) -> VerificationStatus:
         return VerificationStatus.NOT_RUN
 
 
+def _parse_evidence_level(value: Any) -> EvidenceLevel:
+    if isinstance(value, EvidenceLevel):
+        return value
+    try:
+        return EvidenceLevel(str(value or "E0").strip().upper())
+    except ValueError:
+        return EvidenceLevel.E0
+
+
+def _parse_finding_state(value: Any) -> FindingState:
+    if isinstance(value, FindingState):
+        return value
+    try:
+        return FindingState(str(value or "candidate").strip().lower())
+    except ValueError:
+        return FindingState.CANDIDATE
+
+
 def fingerprint_components(
     *,
-    file_path: Optional[str],
-    start_line: Optional[int],
+    file_path: str | None,
+    start_line: int | None,
     title: str,
-    rule_id: Optional[str] = None,
-    cwe_id: Optional[str] = None,
+    rule_id: str | None = None,
+    cwe_id: str | None = None,
 ) -> str:
     """Stable fingerprint for dedupe across analyzers."""
     parts = [
@@ -110,12 +133,7 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
             location = None
 
     title = str(data.get("title") or data.get("name") or "Untitled finding")
-    description = str(
-        data.get("description")
-        or data.get("detail")
-        or data.get("message")
-        or title
-    )
+    description = str(data.get("description") or data.get("detail") or data.get("message") or title)
     snippet = data.get("code_snippet") or data.get("snippet") or data.get("code")
     evidence: list[Evidence] = []
     if snippet:
@@ -125,6 +143,7 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
                 summary="code snippet",
                 location=location,
                 snippet=str(snippet)[:20_000],
+                level=_parse_evidence_level(data.get("evidence_level")),
             )
         )
 
@@ -148,11 +167,7 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
         confidence = min(1.0, confidence / 100.0)
 
     # Prefer explicit category; fall back to legacy vulnerability_type / type.
-    category = (
-        data.get("category")
-        or data.get("vulnerability_type")
-        or data.get("type")
-    )
+    category = data.get("category") or data.get("vulnerability_type") or data.get("type")
 
     # Prefer confidence; accept ai_confidence (0-1 or 0-100).
     if data.get("confidence") is None and data.get("ai_confidence") is not None:
@@ -196,10 +211,10 @@ def finding_from_legacy_dict(data: dict[str, Any]) -> Finding:
         "owasp": data.get("owasp"),
         "location": location,
         "evidence": evidence,
+        "evidence_level": _parse_evidence_level(data.get("evidence_level")),
+        "finding_state": _parse_finding_state(data.get("finding_state")),
         "confidence": confidence,
-        "risk_score": (
-            float(data["risk_score"]) if data.get("risk_score") is not None else 0.0
-        ),
+        "risk_score": (float(data["risk_score"]) if data.get("risk_score") is not None else 0.0),
         "analyzer": data.get("analyzer") or data.get("source"),
         "rule_id": data.get("rule_id") or data.get("rule"),
         "fingerprint": fp,
@@ -231,6 +246,8 @@ def finding_to_legacy_dict(finding: Finding) -> dict[str, Any]:
         "severity": finding.severity.value,
         "status": finding.status.value,
         "verification_status": finding.verification_status.value,
+        "evidence_level": finding.evidence_level.value,
+        "finding_state": finding.finding_state.value,
         "category": finding.category,
         "vulnerability_type": finding.category or finding.rule_id or "other",
         "cwe_id": finding.cwe_id,

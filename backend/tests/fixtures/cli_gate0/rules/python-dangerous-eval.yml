@@ -1,0 +1,13 @@
+rules:
+  - id: deepaudit.python.dangerous-eval
+    languages:
+      - python
+    message: Avoid eval() on an expression that may contain untrusted input.
+    severity: ERROR
+    metadata:
+      category: security
+      cwe:
+        - "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      confidence: HIGH
+    patterns:
+      - pattern: eval($EXPRESSION)
