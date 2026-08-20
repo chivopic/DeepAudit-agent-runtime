@@ -1,5 +1,13 @@
 # DeepAudit CLI & Interactive Security Agent PRD
 
+> **2026-08-20 implementation decision:** the base local scanner is now being
+> extracted as a zero-third-party-runtime Python distribution under `cli/`.
+> LangGraph/Agent Harness remains a backend architecture and the earlier CLI
+> prototype remains an oracle, not the lightweight CLI runtime. See
+> [`ADR-004`](architecture/ADR-004-lightweight-cli-extraction.md) and
+> [`CLI_LIGHTWEIGHT_DESIGN.md`](CLI_LIGHTWEIGHT_DESIGN.md). Interactive/TUI/AI
+> layers remain later optional work and must not enlarge the base install.
+
 > 文档状态：Draft v0.2（已完成第一轮对抗性审查）  
 > 产品阶段：MVP Proposal  
 > 日期：2026-08-19  

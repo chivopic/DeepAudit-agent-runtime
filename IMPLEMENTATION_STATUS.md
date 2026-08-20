@@ -9,6 +9,19 @@
 
 M0–M11 remains complete. Phase 0/1 trust + async + budget/MCP/mapper fixes landed same day.
 
+**CLI-L1 lightweight extraction** · status: **IMPLEMENTED / DOGFOOD** (2026-08-20)
+
+- ADR-004 authorizes an independent `cli/` distribution without changing the
+  server-side Agent Runtime decisions.
+- Base CLI uses only the Python standard library plus an explicit external
+  Semgrep `1.173.0` executable.
+- Implemented: `doctor`, non-interactive `audit`, terminal/JSON output,
+  deterministic manifest, governed subprocess, E0 candidate normalization,
+  coverage/partial semantics, stable exit codes, and atomic external output.
+- Verification: 19 CLI tests, Ruff, strict MyPy, real Semgrep 1/1 longitudinal
+  scan, 17 KB wheel, and clean `--no-deps` install in a fresh venv.
+- Design record: [`docs/CLI_LIGHTWEIGHT_DESIGN.md`](docs/CLI_LIGHTWEIGHT_DESIGN.md).
+
 ## Milestone roadmap
 
 | ID | Title | Status | Tests |
