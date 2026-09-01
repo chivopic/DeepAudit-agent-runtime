@@ -1,0 +1,19 @@
+# SECURITY WARNING
+# ----------------
+# This override restores the historical architecture where the Web/API backend
+# can control the host Docker daemon directly.  A backend compromise can then
+# become a host-level Docker compromise.  Do not use this on untrusted or
+# Internet-facing deployments.
+#
+# Preferred direction: run sandbox execution in a separate worker that owns the
+# Docker socket and exposes only a narrow, typed execution protocol.
+#
+# Temporary legacy usage:
+#   docker compose -f docker-compose.yml -f docker-compose.legacy-sandbox.yml up -d
+
+services:
+  backend:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SANDBOX_ENABLED=true
