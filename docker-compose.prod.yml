@@ -3,6 +3,8 @@
 # =============================================
 # 使用预构建的 GHCR 镜像，无需本地构建
 # 部署命令: curl -fsSL https://raw.githubusercontent.com/lintsinghua/DeepAudit/main/docker-compose.prod.yml | docker compose -f - up -d
+# 安全默认：API/backend 不持有 Docker daemon 权限；动态沙箱默认关闭。
+# 如需临时兼容旧沙箱，可显式叠加 docker-compose.legacy-sandbox.yml。
 
 services:
   db:
@@ -40,14 +42,13 @@ services:
     restart: unless-stopped
     volumes:
       - backend_uploads:/app/uploads
-      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/deepaudit
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
-      - SANDBOX_ENABLED=true
+      - SANDBOX_ENABLED=false
       - SANDBOX_IMAGE=ghcr.io/lintsinghua/deepaudit-sandbox:latest
       # LLM 配置 - 请根据需要修改
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
@@ -103,7 +104,7 @@ services:
     networks:
       - deepaudit-network
 
-  # 预拉取沙箱镜像（后端会按需调用）
+  # 预拉取沙箱镜像，供未来独立 sandbox worker 或显式 legacy override 使用。
   sandbox-pull:
     image: ghcr.io/lintsinghua/deepaudit-sandbox:latest
     restart: "no"
