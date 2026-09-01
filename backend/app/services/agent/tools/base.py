@@ -86,7 +86,14 @@ class AgentTool(ABC):
         start_time = time.time()
         
         try:
-            logger.debug(f"Tool '{self.name}' executing with args: {kwargs}")
+            # Tool arguments frequently contain source code, PoCs, HTTP
+            # headers/tokens, or other secrets.  Never emit full values even at
+            # debug level; parameter names are sufficient for diagnostics.
+            logger.debug(
+                "Tool '%s' executing with arg_keys=%s",
+                self.name,
+                sorted(str(key) for key in kwargs),
+            )
             result = await self._execute(**kwargs)
             
         except Exception as e:
