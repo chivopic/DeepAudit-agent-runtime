@@ -19,6 +19,8 @@ import tempfile
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
 
+from app.services.agent.path_security import WorkspacePathError, resolve_under_workspace
+
 from .base import AgentTool, ToolResult
 from .sandbox_tool import SandboxManager, SandboxConfig
 
@@ -108,7 +110,7 @@ def vulnerable_function(user_input):
 # Fuzzing 测试
 payloads = ["; id", "| whoami", "$(cat /etc/passwd)", "`id`"]
 for payload in payloads:
-    print(f"\\nTesting payload: {payload}")
+    print(f"\nTesting payload: {payload}")
     executed_commands.clear()
     try:
         vulnerable_function(payload)
@@ -314,11 +316,20 @@ class ExtractFunctionTool(AgentTool):
         import ast
         import re
 
-        full_path = os.path.join(self.project_root, file_path)
-        if not os.path.exists(full_path):
-            return ToolResult(success=False, error=f"文件不存在: {file_path}")
+        try:
+            full_path = resolve_under_workspace(self.project_root, file_path)
+        except WorkspacePathError:
+            return ToolResult(
+                success=False,
+                error="安全错误：不允许访问项目目录外的文件",
+            )
 
-        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+        if not full_path.exists():
+            return ToolResult(success=False, error=f"文件不存在: {file_path}")
+        if not full_path.is_file():
+            return ToolResult(success=False, error=f"不是文件: {file_path}")
+
+        with full_path.open('r', encoding='utf-8', errors='ignore') as f:
             code = f.read()
 
         # 检测语言
