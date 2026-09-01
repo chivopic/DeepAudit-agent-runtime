@@ -2,13 +2,15 @@ name: Agent runtime tests
 
 on:
   push:
-    branches: [main, master, "v*"]
+    branches: [main, master, "v*", "security/**"]
     paths:
       - "backend/**"
+      - "docker-compose*.yml"
       - ".github/workflows/agent-pytest.yml"
   pull_request:
     paths:
       - "backend/**"
+      - "docker-compose*.yml"
       - ".github/workflows/agent-pytest.yml"
 
 jobs:
@@ -31,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
-      - name: Run agent runtime unit tests (M1–M11)
+      - name: Run agent runtime unit tests (M1–M11 + security hardening)
         run: |
           uv run pytest \
             tests/test_agent_domain.py \
@@ -45,6 +47,7 @@ jobs:
             tests/test_agent_observability_m9.py \
             tests/test_agent_evals_m10.py \
             tests/test_agent_harness_m11.py \
+            tests/test_runtime_security_hardening.py \
             -q --tb=short
 
       - name: Run eval CI suite
