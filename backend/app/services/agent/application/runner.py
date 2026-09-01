@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -123,14 +124,37 @@ class AuditRunner:
         token = set_runtime(runtime)
         try:
             app = self._graph()
-            result = await app.ainvoke(
-                state,
-                {
-                    "configurable": {
-                        "thread_id": aid,
-                        "runtime": runtime,
-                    }
-                },
+            # ``RunBudget.max_duration_seconds`` is a hard wall-clock cap, not
+            # merely advisory metadata.  Node/tool-level timeouts still apply
+            # inside this outer guard.
+            async with asyncio.timeout(request.budget.max_duration_seconds):
+                result = await app.ainvoke(
+                    state,
+                    {
+                        "configurable": {
+                            "thread_id": aid,
+                            "runtime": runtime,
+                        }
+                    },
+                )
+        except TimeoutError:
+            message = (
+                "audit exceeded runtime budget "
+                f"({request.budget.max_duration_seconds}s)"
+            )
+            logger.warning("audit run timed out: %s", aid)
+            rec = await self.store.save_result(
+                aid,
+                status=AuditStatus.FAILED,
+                findings=[],
+                events=[{"kind": "task.timeout", "message": message}],
+                error_message=message,
+            )
+            return AuditRunResult(
+                audit_id=aid,
+                status=AuditStatus.FAILED,
+                events=rec.events,
+                record=rec,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("audit run failed: %s", aid)
