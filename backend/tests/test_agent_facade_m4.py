@@ -188,9 +188,17 @@ async def test_graph_audits_requires_auth():
 
 
 @pytest.mark.asyncio
-async def test_graph_audits_http_routes():
+async def test_graph_audits_http_routes(monkeypatch):
+    from app.api.v1.endpoints import graph_audits
     from app.main import app
 
+    # Synchronous execution is an operator opt-in after runtime hardening.
+    monkeypatch.setattr(
+        graph_audits.settings,
+        "GRAPH_AUDITS_SYNC_START",
+        True,
+        raising=False,
+    )
     cleanup = _override_auth(app)
     try:
         transport = ASGITransport(app=app)
@@ -237,9 +245,16 @@ async def test_graph_audits_http_routes():
 
 
 @pytest.mark.asyncio
-async def test_graph_audits_rejects_other_user():
+async def test_graph_audits_rejects_other_user(monkeypatch):
+    from app.api.v1.endpoints import graph_audits
     from app.main import app
 
+    monkeypatch.setattr(
+        graph_audits.settings,
+        "GRAPH_AUDITS_SYNC_START",
+        True,
+        raising=False,
+    )
     owner = _FakeUser("owner-1")
     other = _FakeUser("intruder-2")
     cleanup = _override_auth(app, owner)
