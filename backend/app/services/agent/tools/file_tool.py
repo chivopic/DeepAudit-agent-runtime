@@ -10,6 +10,8 @@ import asyncio
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
+from app.services.agent.path_security import WorkspacePathError, resolve_under_workspace
+
 from .base import AgentTool, ToolResult
 
 
@@ -133,11 +135,10 @@ class FileReadTool(AgentTool):
                     success=False,
                     error=f"文件被排除或不在目标文件列表中: {file_path}",
                 )
-            
-            # 安全检查：防止路径遍历
-            # Security Fix: 使用 realpath 解析软链接，防止绕过项目根目录检查
-            full_path = os.path.realpath(os.path.join(self.project_root, file_path))
-            if not full_path.startswith(os.path.realpath(self.project_root)):
+
+            try:
+                full_path = str(resolve_under_workspace(self.project_root, file_path))
+            except WorkspacePathError:
                 return ToolResult(
                     success=False,
                     error="安全错误：不允许访问项目目录外的文件",
@@ -327,17 +328,15 @@ class FileSearchTool(AgentTool):
     ) -> ToolResult:
         """执行文件搜索"""
         try:
-            # 确定搜索目录
-            if directory:
-                # Security Fix: 使用 realpath 解析软链接，防止绕过项目根目录检查
-                search_dir = os.path.realpath(os.path.join(self.project_root, directory))
-                if not search_dir.startswith(os.path.realpath(self.project_root)):
-                    return ToolResult(
-                        success=False,
-                        error="安全错误：不允许搜索项目目录外的内容",
-                    )
-            else:
-                search_dir = self.project_root
+            try:
+                search_dir = str(
+                    resolve_under_workspace(self.project_root, directory or ".")
+                )
+            except WorkspacePathError:
+                return ToolResult(
+                    success=False,
+                    error="安全错误：不允许搜索项目目录外的内容",
+                )
             
             # 编译搜索模式
             flags = 0 if case_sensitive else re.IGNORECASE
@@ -382,9 +381,12 @@ class FileSearchTool(AgentTool):
                         continue
                     
                     try:
+                        safe_file = str(
+                            resolve_under_workspace(self.project_root, relative_path)
+                        )
                         # 异步读取文件，避免阻塞事件循环
                         lines = await asyncio.to_thread(
-                            self._read_file_lines_sync, file_path
+                            self._read_file_lines_sync, safe_file
                         )
 
                         files_searched += 1
@@ -412,7 +414,7 @@ class FileSearchTool(AgentTool):
                         if len(results) >= max_results:
                             break
                             
-                    except Exception:
+                    except (WorkspacePathError, OSError):
                         continue
                 
                 if len(results) >= max_results:
@@ -530,8 +532,9 @@ class ListFilesTool(AgentTool):
             if "path" in kwargs and kwargs["path"]:
                 directory = kwargs["path"]
 
-            target_dir = os.path.normpath(os.path.join(self.project_root, directory))
-            if not target_dir.startswith(os.path.normpath(self.project_root)):
+            try:
+                target_dir = str(resolve_under_workspace(self.project_root, directory))
+            except WorkspacePathError:
                 return ToolResult(
                     success=False,
                     error="安全错误：不允许访问项目目录外的目录",
@@ -557,6 +560,11 @@ class ListFilesTool(AgentTool):
                         
                         full_path = os.path.join(root, filename)
                         relative_path = os.path.relpath(full_path, self.project_root)
+
+                        try:
+                            resolve_under_workspace(self.project_root, relative_path)
+                        except WorkspacePathError:
+                            continue
                         
                         # 检查是否在目标文件列表中
                         if self.target_files and relative_path not in self.target_files:
@@ -596,8 +604,15 @@ class ListFilesTool(AgentTool):
                         
                         full_path = os.path.join(target_dir, item)
                         relative_path = os.path.relpath(full_path, self.project_root)
+
+                        try:
+                            safe_path = resolve_under_workspace(
+                                self.project_root, relative_path
+                            )
+                        except WorkspacePathError:
+                            continue
                         
-                        if os.path.isdir(full_path):
+                        if safe_path.is_dir():
                             # 只显示包含目标文件的目录
                             if relative_path in dirs_with_targets or any(
                                 tf.startswith(relative_path + "/") for tf in self.target_files
@@ -623,8 +638,15 @@ class ListFilesTool(AgentTool):
                         
                         full_path = os.path.join(target_dir, item)
                         relative_path = os.path.relpath(full_path, self.project_root)
+
+                        try:
+                            safe_path = resolve_under_workspace(
+                                self.project_root, relative_path
+                            )
+                        except WorkspacePathError:
+                            continue
                         
-                        if os.path.isdir(full_path):
+                        if safe_path.is_dir():
                             dirs.append(relative_path + "/")
                         else:
                             if pattern and not fnmatch.fnmatch(item, pattern):
@@ -688,4 +710,3 @@ class ListFilesTool(AgentTool):
                 success=False,
                 error=f"列出文件失败: {str(e)}",
             )
-
