@@ -9,7 +9,8 @@ Trust boundary:
 - JWT required (same ``get_current_user`` as agent-tasks).
 - Per-audit ownership via ``AuditRequest.user_id`` on subsequent routes.
 - Feature flag GRAPH_AUDITS_ENABLED.
-- GRAPH_AUDITS_FIXTURE_ONLY: reject client host ``local_path``.
+- Client-controlled server ``local_path`` is rejected until a server-side
+  workspace registry exists; graph-audits remains fixture-only in practice.
 - Optional GRAPH_AUDITS_ENFORCE_PROJECT_ACL for Project owner/member checks.
 - Always FakeLLM offline until ModelRouter is wired.
 """
@@ -100,19 +101,6 @@ def _validate_fixture_budget(fixture_files: dict[str, str]) -> None:
         )
 
 
-def _is_absolute_or_host_path(path: str) -> bool:
-    p = path.strip().replace("\\", "/")
-    if not p:
-        return False
-    if p.startswith("/") or p.startswith("~"):
-        return True
-    if len(p) > 1 and p[1] == ":":
-        return True
-    if p.startswith("//"):
-        return True
-    return False
-
-
 async def _assert_project_access(
     db: AsyncSession,
     user: User,
@@ -171,7 +159,6 @@ async def start_graph_audit(
     await _assert_project_access(db, current_user, body.project_id)
 
     fixture_files = dict(body.fixture_files or {})
-    fixture_only = bool(getattr(settings, "GRAPH_AUDITS_FIXTURE_ONLY", True))
 
     if body.source_type == "git":
         # Git clone from client URL is not trusted on this experimental surface yet.
@@ -180,37 +167,29 @@ async def start_graph_audit(
             "git source_type is not enabled on graph-audits (use fixture_files offline)",
         )
 
-    if fixture_only:
-        if body.local_path and _is_absolute_or_host_path(body.local_path):
-            raise HTTPException(
-                400,
-                "client host local_path is rejected; pass fixture_files only "
-                "(GRAPH_AUDITS_FIXTURE_ONLY=true)",
-            )
-        if not fixture_files:
-            raise HTTPException(
-                400,
-                "fixture_files required when GRAPH_AUDITS_FIXTURE_ONLY=true",
-            )
-        _validate_fixture_budget(fixture_files)
-        # Synthetic locator — never point at a client-supplied host path.
-        repo = RepositoryRef(
-            source_type="local",
-            local_path="fixture://graph-audit",
-            metadata={"fixture_only": True},
+    # Client paths are never server capabilities.  Until graph-audits has a
+    # server-managed workspace registry (workspace_id -> trusted path), do not
+    # accept any client-supplied local_path, even a syntactically relative one.
+    if body.local_path:
+        raise HTTPException(
+            400,
+            "client local_path is disabled; use fixture_files until a server "
+            "workspace registry is available",
         )
-    else:
-        # Non-fixture mode still rejects absolute client paths unless explicitly
-        # configured later with a server workspace root.
-        if body.local_path and _is_absolute_or_host_path(body.local_path):
-            raise HTTPException(
-                400,
-                "absolute local_path rejected; use relative server workspace or fixtures",
-            )
-        if fixture_files:
-            _validate_fixture_budget(fixture_files)
-        path = body.local_path or "fixture://graph-audit"
-        repo = RepositoryRef(source_type="local", local_path=path)
+
+    if not fixture_files:
+        raise HTTPException(
+            400,
+            "fixture_files required; server local_path access is disabled",
+        )
+    _validate_fixture_budget(fixture_files)
+
+    # Synthetic locator only; never point at a client-supplied host path.
+    repo = RepositoryRef(
+        source_type="local",
+        local_path="fixture://graph-audit",
+        metadata={"fixture_only": True},
+    )
 
     req = AuditRequest(
         project_id=body.project_id,
@@ -234,18 +213,20 @@ async def start_graph_audit(
         extra={"fixture_files": fixture_files},
     )
 
-    wait = bool(body.wait) and bool(getattr(settings, "GRAPH_AUDITS_SYNC_START", False))
-    # Tests may force wait=True; also allow when env enables sync start.
-    if body.wait and not wait:
-        # Allow explicit wait in test profile via body when SYNC not set —
-        # still only for fixture-only offline runs (no host path).
-        wait = True
+    sync_enabled = bool(getattr(settings, "GRAPH_AUDITS_SYNC_START", False))
+    if body.wait and not sync_enabled:
+        raise HTTPException(
+            400,
+            "synchronous graph-audit start is disabled "
+            "(GRAPH_AUDITS_SYNC_START=false)",
+        )
+    wait = bool(body.wait)
 
     if wait:
         result = await _facade().start(
             req, runtime=runtime, project_id=body.project_id, name=body.name
         )
-        # 200 for sync completion (tests / optional GRAPH_AUDITS_SYNC_START).
+        # 200 for sync completion when explicitly enabled by the operator.
         return result
 
     accepted = await _facade().start_async(
