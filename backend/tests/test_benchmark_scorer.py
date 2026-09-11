@@ -60,7 +60,8 @@ def test_a_finding_without_a_line_cannot_match():
 
 def test_perfect_engine_scores_full_recall_without_false_positives():
     findings = [
-        _f(l.path, l.line, cwe_id=l.cwe, title=l.kind) for l in CORPUS.vulnerable
+        _f(lab.path, lab.line, cwe_id=lab.cwe, title=lab.kind)
+        for lab in CORPUS.vulnerable
     ]
     s = score("perfect", findings, CORPUS.vulnerable, CORPUS.safe_paths)
     assert s.labels_found == len(CORPUS.vulnerable)
