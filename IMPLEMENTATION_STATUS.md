@@ -50,6 +50,58 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Engine comparison benchmark (2026-09-11)
+
+Built to answer the dual-path question — *should the LangGraph path replace
+ReAct, and when* — with numbers rather than impressions. The existing M10 evals
+are smoke-grade (`expected_min_findings`, `expected_cwe_any`, `expected_paths`)
+and cannot arbitrate between two engines.
+
+Lives in [`backend/tests/evals/benchmark/`](backend/tests/evals/benchmark/README.md);
+scoring rules are unit-tested in `backend/tests/test_benchmark_scorer.py` (15).
+
+**Negatives are the point.** Half the corpus is safe code written to *look*
+risky, because false-positive rate is unmeasurable without it and an engine
+that flags everything would otherwise score perfectly.
+
+### The runner can refuse to answer
+
+ReAct needs an embedding provider (RAG) and the sandbox image (Semgrep, Bandit,
+Gitleaks). Without them it is a crippled engine, so the runner checks
+preconditions, marks the run `DEGRADED` and **withholds the verdict**. A
+benchmark that quietly reports a degraded baseline is worse than no benchmark:
+it would "prove" whatever the newer engine happens to do.
+
+### First run (NOT a verdict)
+
+```text
+graph   recall 14/14 (100.0%)  findings 23  FP(safe) 5  unmatched 4  tokens  6836   41.6s
+react   recall  8/14 ( 57.1%)  findings 16  FP(safe) 0  unmatched 8  tokens 19078  144.5s
+        ⚠ DEGRADED — ran without embeddings and without the sandbox image
+VERDICT WITHHELD
+```
+
+ReAct ran without RAG and without its external scanners, so this says nothing
+about which engine is better. What it does establish: the harness works, and
+the graph path's floor competence on single-file patterns is solid and cheap.
+
+The graph path's false positives were all from the built-in heuristic pattern
+scanner (`Possible SQL string` on parameterised queries), not from the model.
+
+### Known limits, recorded so the numbers are not over-read
+
+- **Single runs are noisy.** Model nondeterminism moved the graph engine's
+  false positives between 2 and 5 across two runs of an identical corpus.
+- **The corpus tests single-file patterns**, which flatters a per-file
+  analyser. One cross-file case exists (an incomplete sanitiser) but the sink
+  is still visibly concatenated, so multi-file reasoning is not yet isolated.
+- **Detection only.** Verification quality is not scored — the graph path is
+  Phase 1 and always reports `NOT_RUN`.
+
+**Before any switch decision:** a full-strength ReAct run (embeddings + sandbox
+image), repeated runs to average out nondeterminism, and cross-file cases that
+actually isolate dataflow reasoning.
+
 ## K2 closed: docker.sock off the API (2026-09-11)
 
 ADR-003 called the socket-on-API arrangement an unacceptable production blast
@@ -420,7 +472,7 @@ harness/          # M11 AgentSpec + AgentRuntime
 | K2 | ~~docker.sock on API compose~~ | **Fixed** 2026-09-11 (sandbox worker) |
 | K4 | Cancel mid-flight is cooperative/in-process | Medium |
 | K5 | Memory checkpointer default | Medium (dev) |
-| K8 | CI gate added; fuller eval suite still local | Low |
+| K8 | CI gate added; comparison benchmark added (needs full-strength ReAct to arbitrate) | Low |
 | K9 | ~~GraphRecursionError over ~20 files~~ | **Fixed** 2026-09-11 |
 | K10 | ~~total_files always 0 when polling~~ | **Fixed** 2026-09-11 |
 

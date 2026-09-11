@@ -50,6 +50,7 @@ jobs:
             tests/test_agent_project_source.py \
             tests/test_agent_realrepo_regressions.py \
             tests/test_sandbox_worker.py \
+            tests/test_benchmark_scorer.py \
             -q --tb=short
 
       - name: Run eval CI suite
