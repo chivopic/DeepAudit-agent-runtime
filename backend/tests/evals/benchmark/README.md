@@ -55,6 +55,28 @@ it is a weakened engine, so the runner checks and splits what it finds:
 A benchmark that quietly reports a degraded baseline is worse than no
 benchmark: it would "prove" whatever the newer engine happens to do.
 
+## What the engines look like on this corpus
+
+They do not differ by "better"; they fail differently.
+
+| | `graph` | `react` |
+|---|---|---|
+| recall | 17/17, stable across runs | ~9/17, varies |
+| cross-file | 3/3 — but one hit reported on the helper, so partly single-file | 2/3, with reasoning that names the mechanism |
+| false positives on safe code | 2–7, varies | 0 in every run |
+| tokens / wall time | ~10k / ~60s | ~17-21k / ~175s |
+
+The texture matters more than the totals. ReAct's cross-file findings read
+*"SSRF — bypassable host_allowed policy"* and *"SSTI — user-controlled template
+source plus autoescaping off"* — it connected the files, and the second call is
+arguably better than the label it was scored against. But it misses obvious
+single-file patterns (`os.system` with concatenation, `innerHTML`) that the
+graph path never misses.
+
+So: a broad cheap net versus a narrow deep reader. That is an argument for
+routing work to the right engine, not for replacing one with the other — and
+either way this corpus is far too small to settle it.
+
 ## Known limits
 
 - **Single-run results are noisy, and unevenly so.** Across identical runs of
@@ -68,11 +90,22 @@ benchmark: it would "prove" whatever the newer engine happens to do.
   The graph path's false positives still moved (3–5), but its recall did not.
   ReAct's did. One run of ReAct is a coin toss, not a measurement — which is
   why `--repeat` exists and why the runner prints the spread.
-- **The corpus tests single-file patterns.** That is the easy case, and it
-  flatters a per-file analyser. `vulnerable/reports.py` plus
-  `vulnerable/sanitize_util.py` is a first cross-file case (the sanitiser only
-  strips single quotes), but the sink is still visibly concatenated, so it does
-  not yet isolate multi-file reasoning. Deep dataflow cases are the next thing
-  this corpus needs.
+- **Cross-file cases have to be designed carefully, or they measure nothing.**
+  `corpus/*/xfile/` holds three where the dangerous call sits behind a guard
+  that *looks* protective and only the helper in another file shows it is not.
+
+  The first attempt failed: the broken helpers were self-evidently broken
+  (`return True  # TODO`, `AUTOESCAPE = False`), so an engine could score a hit
+  by reading the helper alone. `--show-xfile` exposed this — it prints *where*
+  each hit was reported, and the autoescape "cross-file" hit turned out to be
+  reported on the settings file itself.
+
+  They were rewritten so each helper looks competent in isolation: the SSRF
+  policy blocks cloud metadata endpoints (thoughtful, but a deny-list, so still
+  bypassable) and the template flag reads `LEGACY_TEMPLATE_MODE = True`, which
+  says nothing about escaping on its own.
+
+  **Check `--show-xfile` before believing a cross-file score.** A hit reported
+  on the helper may be a single-file observation.
 - **Detection only.** Verification quality (`verification_status`) is not
   scored; the graph path is Phase 1 and always reports `NOT_RUN`.

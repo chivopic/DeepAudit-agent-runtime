@@ -102,6 +102,42 @@ scanner (`Possible SQL string` on parameterised queries) or from the model
 flagging mitigations as findings — not from missing a real flaw. ReAct scored 0
 false positives in every run: it is consistently the more conservative engine.
 
+### Cross-file cases: designing them is where the work is
+
+`corpus/*/xfile/` adds three cases where the dangerous call sits behind a guard
+that *looks* protective, and only the helper in another file shows it is not.
+
+**The first attempt did not measure what it claimed.** The broken helpers were
+self-evidently broken (`return True  # TODO`, `AUTOESCAPE = False`), so an
+engine could score a hit by reading the helper alone. `--show-xfile` — which
+prints *where* each hit was reported — exposed it: the autoescape "cross-file"
+hit was reported on the settings file itself.
+
+Rewritten so each helper reads as competent code in isolation: the SSRF policy
+blocks cloud metadata endpoints (thoughtful, but a deny-list, so still
+bypassable), and the template flag is `LEGACY_TEMPLATE_MODE = True`, which says
+nothing about escaping on its own.
+
+### With that fixed, the two engines separate cleanly
+
+| | `graph` | `react` |
+|---|---|---|
+| recall | 17/17, stable | ~9/17, varies |
+| cross-file | 3/3 — one still reported on the helper | 2/3, with mechanism named |
+| false positives on safe code | 2–7, varies | **0 in every run** |
+| tokens / wall time | ~10k / ~60s | ~17–21k / ~175s |
+
+The texture matters more than the totals. ReAct's cross-file findings read
+*"SSRF — bypassable host_allowed policy"* and *"SSTI — user-controlled template
+source plus autoescaping off"*: it connected the files, and the second call is
+arguably better than the label it was scored against. Yet it misses obvious
+single-file patterns (`os.system` with concatenation, `innerHTML`) that the
+graph path never misses.
+
+**They fail differently.** A broad cheap net versus a narrow deep reader. That
+is an argument for routing work to the right engine, not for replacing one with
+the other — and this corpus is still far too small to settle it.
+
 ### This corrects an earlier assumption in this file
 
 The dual-path notes assumed the graph path would be a clear regression because

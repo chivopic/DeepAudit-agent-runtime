@@ -210,9 +210,36 @@ async def run_react(root: str) -> EngineScore:
 ENGINES = {"graph": run_graph, "react": run_react}
 
 
+def _print_xfile_hits(engine: str, result) -> None:
+    """Show what an engine actually said about each cross-file label."""
+    from tests.evals.benchmark.scorer import matches
+
+    print(f"  -- {engine}: cross-file findings --")
+    for label in CORPUS.vulnerable:
+        if not label.cross_file:
+            continue
+        hit = next((f for f in result.raw_findings if matches(label, f)), None)
+        where = f"{label.path.split('/')[-1]}:{label.line}"
+        if hit is None:
+            print(f"     {where:<22} MISSED")
+        else:
+            at = f"{str(hit.get('file_path')).split('/')[-1]}:{hit.get('line_start')}"
+            # Where it was reported matters: a hit on the helper alone can come
+            # from reading that file in isolation, while a hit on the sink means
+            # the engine judged a call that looks guarded.
+            print(f"     {where:<22} [reported at {at:<20}] {str(hit.get('title'))[:52]}")
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engines", default="graph,react")
+    parser.add_argument(
+        "--show-xfile",
+        action="store_true",
+        help="print the finding text matched to each cross-file label, to check "
+             "whether a hit reflects understanding or a pattern that would fire "
+             "on the safe counterpart too",
+    )
     parser.add_argument(
         "--repeat",
         type=int,
@@ -242,6 +269,8 @@ async def main() -> int:
             print(f"running {label} ...")
             r = await runner(root)
             spreads.setdefault(name, []).append(r.labels_found)
+            if args.show_xfile:
+                _print_xfile_hits(name, r)
             results.append(r)
 
     print("\n" + "=" * 100)
