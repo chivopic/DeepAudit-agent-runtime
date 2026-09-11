@@ -146,3 +146,34 @@ def test_advisory_gaps_are_separate_from_blocking_ones():
 
     s.advisory = ["RAG disabled"]
     assert s.advisory and not s.degraded
+
+
+def test_cross_file_labels_exist_and_are_tracked_separately():
+    """Single-file patterns are the easy case; a combined recall hides the gap
+    that actually decides whether one engine can replace the other."""
+    xfile = [lab for lab in CORPUS.vulnerable if lab.cross_file]
+    assert len(xfile) >= 3
+
+    findings = [_f(lab.path, lab.line, cwe_id=lab.cwe, title=lab.kind) for lab in xfile]
+    s = score("x", findings, CORPUS.vulnerable, CORPUS.safe_paths)
+    assert s.xfile_total == len(xfile)
+    assert s.xfile_found == len(xfile)
+    assert s.xfile_recall == 1.0
+
+
+def test_a_cross_file_label_also_matches_at_the_broken_helper():
+    """Flagging the helper shows comprehension too — scoring it wrong would
+    penalise an engine for being right in the other place."""
+    lab = next(x for x in CORPUS.vulnerable if x.cross_file and x.also_at)
+    helper_path, helper_line = lab.also_at[0]
+    assert matches(lab, _f(helper_path, helper_line, cwe_id=lab.cwe))
+
+
+def test_every_cross_file_helper_location_is_a_real_line():
+    from pathlib import Path
+
+    root = Path(__file__).parent / "evals" / "benchmark" / "corpus"
+    for lab in CORPUS.vulnerable:
+        for path, line in lab.also_at:
+            lines = (root / path).read_text(encoding="utf-8").splitlines()
+            assert 1 <= line <= len(lines), f"{path}:{line} out of range"

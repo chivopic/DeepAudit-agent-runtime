@@ -22,6 +22,12 @@ class Label:
     kind: str
     # Some classes are reported a line or two off (decorator, wrapper call).
     tolerance: int = 3
+    # Cross-file cases have two defensible places to report: the sink, and the
+    # helper whose guard is broken. Flagging either shows the engine understood
+    # it, so both count as a hit.
+    also_at: tuple[tuple[str, int], ...] = ()
+    # True when the flaw is invisible in any single file.
+    cross_file: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,28 @@ LABELS: list[Label] = [
     Label("vulnerable/render.js", 7, "CWE-79", "xss"),
     # --- Command injection (node) -----------------------------------------
     Label("vulnerable/build.js", 5, "CWE-78", "command-injection"),
+    # --- Cross-file: the guard looks protective but is not ----------------
+    # Each of these is safe-looking in isolation. The sink has a guard; only
+    # the helper in the other file shows the guard does not hold. A per-file
+    # analyser sees "validated input" and should plausibly pass.
+    Label(
+        "vulnerable/xfile/attachments.py", 12, "CWE-22", "path-traversal",
+        also_at=(("vulnerable/xfile/validators.py", 6),),
+        cross_file=True,
+    ),
+    Label(
+        "vulnerable/xfile/fetcher.py", 12, "CWE-918", "ssrf",
+        also_at=(("vulnerable/xfile/policy.py", 15),),
+        cross_file=True,
+    ),
+    Label(
+        "vulnerable/xfile/templating.py", 6, "CWE-79", "xss",
+        also_at=(
+            ("vulnerable/xfile/settings.py", 4),
+            ("vulnerable/xfile/templating.py", 10),
+        ),
+        cross_file=True,
+    ),
     # --- Cross-file: the sanitiser is incomplete --------------------------
     # Only wrong once you read clean() in sanitize_util.py: stripping single
     # quotes leaves backslash and comment payloads intact. A per-file analyser
@@ -72,6 +100,14 @@ SAFE_PATHS: list[str] = [
     # so the same shape is genuinely safe.
     "safe/escape_util_safe.py",
     "safe/reports_safe.py",
+    # Cross-file counterparts: identical shape, but the guard in the other
+    # file is real.
+    "safe/xfile/validators_safe.py",
+    "safe/xfile/attachments_safe.py",
+    "safe/xfile/policy_safe.py",
+    "safe/xfile/fetcher_safe.py",
+    "safe/xfile/settings_safe.py",
+    "safe/xfile/templating_safe.py",
 ]
 
 CORPUS = Corpus(vulnerable=LABELS, safe_paths=SAFE_PATHS)

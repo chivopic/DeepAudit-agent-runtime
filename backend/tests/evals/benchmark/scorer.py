@@ -58,15 +58,30 @@ def _line_of(finding: dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _same_file(finding_path: str, label_path: str) -> bool:
+    a, b = _norm_path(finding_path), _norm_path(label_path)
+    return bool(a) and (a.endswith(b) or b.endswith(a))
+
+
 def matches(label: Label, finding: dict[str, Any]) -> bool:
-    """Does ``finding`` plausibly report ``label``?"""
-    fpath = _norm_path(finding.get("file_path") or finding.get("path"))
-    lpath = _norm_path(label.path)
-    if not fpath or not (fpath.endswith(lpath) or lpath.endswith(fpath)):
+    """Does ``finding`` plausibly report ``label``?
+
+    Cross-file labels accept the sink *or* the helper whose guard is broken:
+    flagging either shows the engine understood the flaw, and insisting on one
+    would score an engine wrong for being right in the other place.
+    """
+    fpath = finding.get("file_path") or finding.get("path") or ""
+    line = _line_of(finding)
+    if line is None:
         return False
 
-    line = _line_of(finding)
-    if line is None or abs(line - label.line) > label.tolerance:
+    locations = [(label.path, label.line)] + [
+        (p, ln) for p, ln in label.also_at
+    ]
+    if not any(
+        _same_file(fpath, p) and abs(line - ln) <= label.tolerance
+        for p, ln in locations
+    ):
         return False
 
     if _cwe_of(finding) == label.cwe:
@@ -91,8 +106,17 @@ class EngineScore:
     unmatched: int = 0
     tokens: int = 0
     seconds: float = 0.0
+    # Cross-file labels tracked separately: single-file patterns are the easy
+    # case and flatter a per-file analyser, so a combined recall hides the gap
+    # that actually decides whether one engine can replace the other.
+    xfile_total: int = 0
+    xfile_found: int = 0
     missed: list[str] = field(default_factory=list)
     fp_examples: list[str] = field(default_factory=list)
+    # Kept for --show-xfile: what the engine actually said, not just whether
+    # it scored. A hit that would also fire on the safe counterpart is not
+    # comprehension, and only the text shows the difference.
+    raw_findings: list[dict[str, Any]] = field(default_factory=list)
     # Capabilities this engine was missing at run time. Non-empty means the
     # numbers describe a crippled engine and must not be read as a verdict.
     degraded: list[str] = field(default_factory=list)
@@ -109,11 +133,16 @@ class EngineScore:
         """Safe files carrying at least one false finding, as a share."""
         return self.false_positives / self.safe_files if self.safe_files else 0.0
 
+    @property
+    def xfile_recall(self) -> float:
+        return self.xfile_found / self.xfile_total if self.xfile_total else 0.0
+
     def row(self) -> str:
         return (
             f"{self.engine:<12} "
             f"recall {self.labels_found:>2}/{self.labels_total:<2} "
             f"({self.recall * 100:5.1f}%)  "
+            f"x-file {self.xfile_found}/{self.xfile_total}  "
             f"findings {self.findings_total:>3}  "
             f"FP(safe) {self.false_positives:>3}  "
             f"unmatched {self.unmatched:>3}  "
@@ -139,6 +168,8 @@ def score(
         labels_total=len(labels),
         findings_total=len(findings),
         safe_files=len(safe_paths),
+        xfile_total=sum(1 for lab in labels if lab.cross_file),
+        raw_findings=findings,
         tokens=tokens,
         seconds=seconds,
     )
@@ -153,6 +184,8 @@ def score(
             result.missed.append(f"{label.path}:{label.line} {label.cwe}")
         else:
             result.labels_found += 1
+            if label.cross_file:
+                result.xfile_found += 1
             matched_findings.add(hit)
 
     for i, f in enumerate(findings):
