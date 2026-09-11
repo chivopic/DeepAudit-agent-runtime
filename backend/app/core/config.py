@@ -144,6 +144,17 @@ class Settings(BaseSettings):
     SANDBOX_NO_NEW_PRIVILEGES: bool = True  # 禁止提权，某些环境可能需要关闭
     SANDBOX_USER: str = "1000:1000"  # 沙箱容器运行用户
 
+    # ---- LangGraph checkpointing ----
+    # "memory" is a dict that dies with the process, so a crash means
+    # re-running from zero. "postgres" survives a restart; "auto" picks it when
+    # a DSN is resolvable and falls back to memory otherwise.
+    AGENT_CHECKPOINT_BACKEND: str = "auto"
+    # Defaults to DATABASE_URL. SQLAlchemy dialect prefixes are stripped, since
+    # psycopg cannot parse "postgresql+asyncpg://".
+    AGENT_CHECKPOINT_DSN: Optional[str] = None
+    # Seconds to wait for the checkpoint database before giving up.
+    AGENT_CHECKPOINT_CONNECT_TIMEOUT: int = 5
+
     # ---- Sandbox worker (ADR-003 #6) ----
     # When set, the API sends sandbox work to this URL instead of opening
     # docker.sock itself. The worker owns the socket; the API must not.
