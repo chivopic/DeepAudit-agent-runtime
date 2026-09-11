@@ -46,7 +46,36 @@ uv run pytest \
 # 2026-07-24 post Codex Phase 0/1: **128 passed**
 # 2026-07-24 node tools/tracer/budget wiring: **129 passed**
 # 2026-07-24 graph-audits JWT auth: **131 passed** (agent suite)
+# 2026-09-11 re-verified unchanged: **131 passed**
 ```
+
+## Legacy suite repair (2026-09-11)
+
+The M0–M11 gate was green, but the **full** backend suite was not: 8 tests
+failed. All 8 predated the agent-runtime work (reproduced on `main`), so they
+were latent, not regressions. Now fixed:
+
+```bash
+cd backend && uv run pytest -q
+# 2026-09-11: **1082 passed, 8 skipped, 0 failed**
+```
+
+| Fix | Detail |
+|-----|--------|
+| `BaseAgent._cancel_callback` | Initialiser had slipped into the body of `cancel()`, so the attribute only existed after `cancel()`/`set_cancel_callback()` had been called; any earlier `is_cancelled` read raised `AttributeError` and aborted the run. Moved to `__init__` beside `_cancelled`. |
+| `tests/test_executor.py` | Dropped a stub patching `executor.get_agent_config`, a config fallback that no longer exists; the test now asserts the real contract (`default_timeout` defaults to 600). |
+| `tests/test_event_manager_deep.py` | Dropped two stubs patching `event_manager.get_agent_config` (SSE heartbeat is now a hard-coded 30s). Sequence filtering is asserted via a terminal event; the queue fallback via a short `wait_for`. |
+
+**Compatibility impact:** `base.py` is on the production ReAct path. Production
+was masked from the bug because the only construction site
+(`agent_tasks.py:455-459`) always calls `set_cancel_callback` before running;
+the fix removes that ordering dependency. No signature or API change.
+
+**Not addressed** (unchanged, still open): graph-audits is hard-wired to
+`FakeLLM` (`graph_audits.py:232`) and defaults to `GRAPH_AUDITS_FIXTURE_ONLY`,
+so the LangGraph path cannot audit a real repository; the frontend does not
+call `/api/v1/graph-audits/*` at all. Production remains ReAct (K1). Repo-wide
+Ruff/Black/MyPy remain unclean on legacy code and are not gated by CI.
 
 ## Post-M11 audit hardening (same day)
 
