@@ -96,6 +96,8 @@ class EngineScore:
     # Capabilities this engine was missing at run time. Non-empty means the
     # numbers describe a crippled engine and must not be read as a verdict.
     degraded: list[str] = field(default_factory=list)
+    # Gaps that weaken the run without invalidating it; reported, not blocking.
+    advisory: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
     @property
