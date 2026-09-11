@@ -1,4 +1,4 @@
-name: Agent runtime tests
+name: Backend tests
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
       - ".github/workflows/agent-pytest.yml"
 
 jobs:
-  pytest-agent:
+  backend-tests:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -31,30 +31,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
-      - name: Run agent runtime unit tests (M1–M11)
-        run: |
-          uv run pytest \
-            tests/test_agent_domain.py \
-            tests/test_agent_graph_m2.py \
-            tests/test_agent_persistence_m3.py \
-            tests/test_agent_facade_m4.py \
-            tests/test_agent_context_m5.py \
-            tests/test_agent_sandbox_m6.py \
-            tests/test_agent_verification_m7.py \
-            tests/test_agent_tooling_m8.py \
-            tests/test_agent_observability_m9.py \
-            tests/test_agent_evals_m10.py \
-            tests/test_agent_harness_m11.py \
-            tests/test_agent_llm_gateway.py \
-            tests/test_agent_dedupe.py \
-            tests/test_agent_project_source.py \
-            tests/test_agent_realrepo_regressions.py \
-            tests/test_sandbox_worker.py \
-            tests/test_benchmark_scorer.py \
-            tests/test_agent_finding_quality.py \
-            tests/test_agent_cross_file_context.py \
-            tests/test_agent_verification_wiring.py \
-            -q --tb=short
+      # The whole suite, not a hand-maintained list. Eight failures once lived
+      # on main for months because the list did not name the files that held
+      # them, and every new test file had to be remembered into CI by hand.
+      - name: Run backend test suite
+        run: uv run pytest -q --tb=short
+
+      - name: Smoke check (a real audit, end to end)
+        # Unit tests import the thing they test, so they cannot tell you the
+        # thing is reachable. Every real bug here was found by running it.
+        run: uv run python scripts/smoke_audit.py
 
       - name: Run eval CI suite
         run: uv run python -m tests.evals.runner --ci

@@ -50,6 +50,60 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Process: the repeated defect, and three guards against it (2026-09-11)
+
+Four features in this repository were built, tested, marked **Done**, and never
+connected to anything:
+
+| Feature | Symptom |
+|---------|---------|
+| `FakeLLM` → `ModelRouter` | the graph path could not reach a real model at all |
+| `severity_threshold` | the API accepted the parameter and discarded it |
+| M7 verification subgraph | every finding stayed `NOT_RUN` whatever was requested |
+| **M11 Agent Harness** | still unreferenced by production code today |
+
+Unit tests cannot catch this. They import the thing they test, so the thing is
+always reachable from where they stand. Green tests were precisely what made
+the gap invisible.
+
+### 1. CI runs the whole suite
+
+It ran **295 of 1254** tests — a hand-maintained list of filenames. The eight
+failures found at the start of this work lived on `main` because the list did
+not name the files holding them, and every new test file had to be remembered
+into CI by hand.
+
+Now `pytest`, plus the smoke check below, plus the eval suite.
+
+### 2. A reachability test, run from production's side
+
+`backend/tests/test_production_wiring.py` asserts every package under
+`app/services/agent/` is imported by code outside its own package and outside
+`tests/`. Exceptions live in `KNOWN_UNWIRED` and need a written reason, so
+adding one is a deliberate act rather than an omission.
+
+It currently reports one: **`harness`**. `AgentRuntime`, `ModelRouter`,
+`PermissionPolicy` and `BudgetManager` are referenced only by tests.
+`graph_audits` reaches the real model through `LLMServiceGateway` instead, so
+`ModelRouter` — the harness's intended wiring point — is dead. **Connect it or
+drop it**; leaving it is what this test exists to make visible.
+
+### 3. A smoke script that actually runs an audit
+
+`backend/scripts/smoke_audit.py`. Every real bug in this codebase was found by
+running it, not by the suite:
+
+| Bug | Why the tests missed it |
+|-----|-------------------------|
+| `GraphRecursionError` over ~20 files | fixtures hold a handful |
+| `total_files` always 0 | tests used the sync path, clients poll |
+| every LLM finding dropped | `FakeLLM` emits no ```` ```json ```` fences |
+| the SSE stream never closed | nothing had ever subscribed |
+
+So it audits **30 files** (deliberately past LangGraph's stock recursion limit
+of 25), checks the results survive persistence, and checks the event stream
+terminates. `--real-llm` runs it against the configured model.
+
 ## Verification: M7 was unreachable, and measuring it exposed a scoring bug (2026-09-11)
 
 ### The subgraph was never called
@@ -663,7 +717,8 @@ harness/          # M11 AgentSpec + AgentRuntime
 | K2 | ~~docker.sock on API compose~~ | **Fixed** 2026-09-11 (sandbox worker) |
 | K4 | Cancel mid-flight is cooperative/in-process | Medium |
 | K5 | Memory checkpointer default | Medium (dev) |
-| K8 | CI gate added; comparison benchmark added (needs full-strength ReAct to arbitrate) | Low |
+| K8 | CI now runs the full suite + smoke + evals | **Fixed** 2026-09-11 |
+| K11 | M11 harness unreferenced by production (ModelRouter dead) | Medium — wire or drop |
 | K9 | ~~GraphRecursionError over ~20 files~~ | **Fixed** 2026-09-11 |
 | K10 | ~~total_files always 0 when polling~~ | **Fixed** 2026-09-11 |
 
