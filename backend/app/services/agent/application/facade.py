@@ -175,6 +175,7 @@ class GraphAuditFacade:
         if row.graph_snapshot:
             b = row.graph_snapshot.get("budget") or {}
             analyzed = int(b.get("files_analyzed") or 0)
+            total = int(row.graph_snapshot.get("total_files") or 0)
         return task_summary_from_run(
             audit_id=row.audit_id,
             project_id=row.request.project_id if row.request else None,
