@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -126,6 +127,76 @@ def _normalize_cwe(value: Any) -> Optional[str]:
     return f"CWE-{m.group(1)}" if m else None
 
 
+# Phrases in which a model is describing a defence, not a defect. Kept
+# phrase-level rather than word-level: bare "safe" or "mitigated" appear in
+# plenty of genuine findings.
+_DEFENCE_PHRASES = (
+    "mitigated by",
+    "mitigated via",
+    "mitigated through",
+    "is mitigated",
+    "already mitigated",
+    "properly validated",
+    "properly escaped",
+    "properly sanitized",
+    "properly sanitised",
+    "correctly validated",
+    "correctly escaped",
+    "not a vulnerability",
+    "not exploitable",
+    "no vulnerability",
+    "no security issue",
+    "appears safe",
+    "is safe because",
+    "已缓解",
+    "不是漏洞",
+    "不可利用",
+    "不存在漏洞",
+)
+
+# If any of these also appear, the model is saying the defence does not hold —
+# which is a real finding and must survive.
+_STILL_VULNERABLE_PHRASES = (
+    "not mitigated",
+    "insufficient",
+    "insufficiently",
+    "incomplete",
+    "partial",
+    "partially",
+    "bypass",
+    "can be circumvented",
+    "still vulnerable",
+    "however",
+    "but it",
+    "but the",
+    "可绕过",
+    "不充分",
+    "仍然",
+)
+
+
+def _is_defence_note(item: dict[str, Any]) -> bool:
+    """Is this the model describing a defence rather than reporting a defect?
+
+    Models asked for "findings" will happily narrate what the code does right
+    — "SSRF mitigated by strict host allowlist" — and every one of those is a
+    false positive in a security report. Worse than noise: a report full of
+    non-issues teaches people to skim it.
+
+    Conservative on purpose. Anything hinting the defence is incomplete is
+    kept, because dropping a real finding costs far more than keeping a
+    tidy-looking one.
+    """
+    text = " ".join(
+        str(item.get(k) or "") for k in ("title", "description")
+    ).lower()
+    if not text.strip():
+        return False
+    if any(p in text for p in _STILL_VULNERABLE_PHRASES):
+        return False
+    return any(p in text for p in _DEFENCE_PHRASES)
+
+
 def _parse_llm_findings(content: Optional[str]) -> list[dict[str, Any]]:
     """Extract a findings list from a model reply.
 
@@ -148,7 +219,15 @@ def _parse_llm_findings(content: Optional[str]) -> list[dict[str, Any]]:
                 break
     if not isinstance(parsed, list):
         return []
-    return [item for item in parsed if isinstance(item, dict)]
+    items = [item for item in parsed if isinstance(item, dict)]
+
+    kept = [item for item in items if not _is_defence_note(item)]
+    if len(kept) != len(items):
+        logger.debug(
+            "dropped %d finding(s) that described a defence, not a defect",
+            len(items) - len(kept),
+        )
+    return kept
 
 
 def _lang_for(path: str) -> Optional[str]:
@@ -521,6 +600,25 @@ async def plan_audit(state: AuditState, config: Optional[RunnableConfig] = None)
     }
 
 
+def _line_builds_a_string(line: str) -> bool:
+    """Does this line interpolate or concatenate into the literal?
+
+    A bare ``SELECT * FROM`` is just SQL; it is the building of it from parts
+    that makes it injectable. Without this the pattern fires on every
+    parameterised query, which is where most of the scanner's false positives
+    came from.
+    """
+    stripped = line.strip()
+    if '" +' in line or "' +" in line or '+ "' in line or "+ '" in line:
+        return True
+    if '" %' in line or "' %" in line or "%s" in line:
+        return True
+    if ".format(" in line:
+        return True
+    # f-string on the same line as the literal
+    return bool(re.search(r"""f["']""", stripped)) and "{" in stripped
+
+
 def _heuristic_candidates(task: AuditTaskSpec, content: str) -> list[CandidateFinding]:
     """Deterministic pattern hits so Fake-LLM-less runs still produce findings."""
     patterns = [
@@ -533,6 +631,8 @@ def _heuristic_candidates(task: AuditTaskSpec, content: str) -> list[CandidateFi
         ("dangerouslySetInnerHTML", "React XSS sink", Severity.MEDIUM, "CWE-79"),
         ("md5(", "Weak Hash", Severity.LOW, "CWE-328"),
         ("verify=False", "TLS Verification Disabled", Severity.MEDIUM, "CWE-295"),
+        # Only injectable when the statement is built from parts — see
+        # _line_builds_a_string.
         ("SELECT * FROM", "Possible SQL string", Severity.MEDIUM, "CWE-89"),
         ("password =", "Hardcoded secret pattern", Severity.MEDIUM, "CWE-798"),
     ]
@@ -541,6 +641,8 @@ def _heuristic_candidates(task: AuditTaskSpec, content: str) -> list[CandidateFi
     for i, line in enumerate(lines, start=1):
         for needle, title, sev, cwe in patterns:
             if needle in line:
+                if needle == "SELECT * FROM" and not _line_builds_a_string(line):
+                    continue
                 loc = SourceLocation(
                     file_path=task.target_path,
                     start_line=i,
@@ -774,10 +876,18 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
                         LLMMessage(
                             role="system",
                             content=(
-                                "Return JSON array of findings "
+                                "You are auditing code for exploitable security "
+                                "defects. Return a JSON array of findings "
                                 "[{title,description,severity,line,cwe}]. "
                                 "cwe must be a CWE id like 'CWE-89', or null "
-                                "when unsure."
+                                "when unsure.\n"
+                                "Report only defects an attacker could exploit. "
+                                "Do NOT report code that is already defended, "
+                                "and do NOT describe mitigations, good practice "
+                                "or general observations as findings — if the "
+                                "code handles the risk correctly, say nothing "
+                                "about it. Return [] when there is nothing "
+                                "exploitable."
                             ),
                         ),
                         LLMMessage(
@@ -858,13 +968,25 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
 
 
 async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
-    """Normalize candidates into Finding list; drop evidence-less items."""
+    """Normalize candidates into Finding list; drop evidence-less items.
+
+    Also applies ``AuditRequest.severity_threshold``, which until now was
+    accepted by the API and silently ignored.
+    """
     candidates = list(state.get("candidate_findings") or [])
+    req = state.get("request")
+    threshold = req.severity_threshold if req else Severity.INFO
+    min_rank = _SEV_RANK.get(threshold, 0)
+
     normalized: list[Finding] = []
     dropped = 0
+    below_threshold = 0
     for c in candidates:
         if not c.evidence and not c.location:
             dropped += 1
+            continue
+        if _SEV_RANK.get(c.severity, 0) < min_rank:
+            below_threshold += 1
             continue
         normalized.append(
             Finding(
@@ -895,6 +1017,7 @@ async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig]
                 "aggregate_findings",
                 kept=len(normalized),
                 dropped=dropped,
+                below_threshold=below_threshold,
             )
         ],
     }

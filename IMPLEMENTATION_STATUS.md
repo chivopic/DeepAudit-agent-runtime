@@ -50,6 +50,48 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Finding quality: defences are not defects (2026-09-11)
+
+The benchmark's negative fixtures exposed what was actually wrong with the
+graph path's output: it reported the model's *descriptions of defences* as
+findings — `SSRF mitigated by strict host allowlist`, `Path traversal mitigated
+via resolve_within helper`. A report full of non-issues is worse than a short
+one; it teaches people to skim.
+
+Three causes, three fixes:
+
+| Cause | Fix |
+|-------|-----|
+| The prompt never said what counts as a finding — it just asked for "findings" | Asks for exploitable defects only, and says explicitly not to report defended code, mitigations or general observations; return `[]` when there is nothing |
+| Nothing filtered the model's output | `_is_defence_note` drops phrases like "mitigated by" / "not a vulnerability". Conservative: anything hinting the defence is *incomplete* ("bypass", "insufficient", "however", "可绕过") is kept, because dropping a real finding costs far more |
+| The `SELECT * FROM` heuristic fired on every parameterised query | `_line_builds_a_string` requires interpolation or concatenation on the line — a bare SELECT is just SQL |
+
+### `severity_threshold` was accepted and ignored
+
+Unrelated find while fixing the above: `AuditRequest.severity_threshold` existed
+in the domain model and appeared **nowhere else in the codebase**. The API took
+the parameter and silently discarded it. It is now applied in
+`aggregate_findings`, and the drop count is reported in the node event rather
+than being invisible.
+
+### Measured, three runs each
+
+```text
+before   FP(safe) 2–7 (varying)   findings 28–31
+after    FP(safe) 0, 0, 0         findings 20–21
+```
+
+**False positives eliminated**, and a third of the noise with them.
+
+The cost is honest and worth recording: cross-file recall on the autoescape
+case fell from 3/3 to 1/3. That is itself evidence — the graph path's
+"cross-file" hits were low-confidence speculation, and once the prompt demands
+exploitability it stops speculating. It does not reason across files; it
+guessed, and guessing scored.
+
+Remaining `unmatched` findings (~4) are on vulnerable files and not
+automatically wrong — planted code contains incidental issues.
+
 ## Engine comparison benchmark (2026-09-11)
 
 Built to answer the dual-path question — *should the LangGraph path replace
