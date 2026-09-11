@@ -50,6 +50,71 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## K2 closed: docker.sock off the API (2026-09-11)
+
+ADR-003 called the socket-on-API arrangement an unacceptable production blast
+radius and specified the fix (#6: "API does not hold docker.sock; a dedicated
+sandbox worker owns container lifecycle"). That worker now exists, and the
+socket is gone from the API in all three compose files.
+
+### Shape
+
+| Piece | Role |
+|-------|------|
+| `app/sandbox_worker/` | The only code that touches docker.sock. Runs as its own container. |
+| `contract.py` | The narrow wire contract. The client says *what* to run; it can never say *how*. |
+| `sandbox_backend.py` | API-side client. `RemoteWorkerBackend` when `SANDBOX_WORKER_URL` is set, else the legacy in-process Docker client for local dev. |
+
+`SandboxManager` keeps its public API, so all ~10 existing tool call sites are
+untouched — only three lines in it ever touched Docker.
+
+### What the boundary actually buys
+
+A compromised API can spend sandbox capacity. It cannot:
+
+- **choose the image, mounts, user, capabilities or privileges** — the request
+  model has no such fields, and the worker builds the container from server
+  settings alone;
+- **mount an arbitrary host path** — `workdir` is resolved (symlinks included)
+  and must stay inside `SANDBOX_WORKSPACE_ROOT`, so asking for `/etc` fails;
+- **turn on networking** — `network` is an allowlist and anything but `none`
+  needs `SANDBOX_ALLOW_NETWORK` (ADR-003 #8);
+- **set loader or proxy environment variables** — `LD_*`, `PATH`, `PYTHONPATH`,
+  `NODE_OPTIONS`, `*_PROXY` are refused by the contract.
+
+The worker fails closed: no `SANDBOX_WORKER_TOKEN` configured means it refuses
+to execute at all, and the API refuses to fall back to a local socket when the
+worker is unreachable.
+
+### Path translation
+
+The worker asks the **host** daemon to mount the workspace, so the path has to
+be valid on the host. `SANDBOX_WORKSPACE_ROOT` (`/var/lib/deepaudit/workspace`
+in compose) is bind-mounted at the same path in both containers, and
+`_get_project_root` now clones there instead of a container-private `/tmp`.
+
+### Verified against a real Docker daemon
+
+```text
+api has docker client: False        (before and after initialize)
+1. plain command in a container  -> ok, uid 1000
+2. tool command, jailed workspace-> ok, reads /workspace
+3. workdir "/etc"                -> refused: outside workspace root
+4. workdir symlink -> /etc       -> refused: outside workspace root
+5. network=bridge                -> refused: needs SANDBOX_ALLOW_NETWORK
+6. timeout                       -> container killed
+```
+
+Compose resolved with `docker compose config`: `backend` has no socket and
+`sandbox-worker` has it, on the internal network with no published ports.
+
+Tests: `backend/tests/test_sandbox_worker.py` (28, in the CI gate).
+Full backend suite: **1170 passed, 8 skipped, 0 failed**.
+
+**Residual:** the in-process Docker client still exists in `SandboxManager` as
+the local-development fallback, reachable only when `SANDBOX_WORKER_URL` is
+unset. The shipped compose files always set it.
+
 ## Real-stack verification: two bugs fixtures could not catch (2026-09-11)
 
 `source_type="project"` shipped with unit tests only. Running it for real —
@@ -352,7 +417,7 @@ harness/          # M11 AgentSpec + AgentRuntime
 | ID | Issue | Severity |
 |----|-------|----------|
 | K1 | Production still ReAct by default | Medium (intentional dual-path) |
-| K2 | docker.sock still on API compose | High (ADR-003; worker not deployed) |
+| K2 | ~~docker.sock on API compose~~ | **Fixed** 2026-09-11 (sandbox worker) |
 | K4 | Cancel mid-flight is cooperative/in-process | Medium |
 | K5 | Memory checkpointer default | Medium (dev) |
 | K8 | CI gate added; fuller eval suite still local | Low |
