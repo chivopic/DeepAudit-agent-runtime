@@ -10,7 +10,7 @@ Covers:
 
 import asyncio
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -151,20 +151,12 @@ class TestDynamicAgentExecutor:
         assert executor._tasks == {}
         assert executor._cancelled is False
 
-    def test_constructor_reads_config_when_timeout_is_none(self):
-        mock_config = MagicMock()
-        mock_config.sub_agent_timeout_seconds = 600
-
-        with patch(
-            "app.services.agent.core.executor.get_agent_config",
-            return_value=mock_config,
-        ):
-            executor = DynamicAgentExecutor(
-                llm_service=None,
-                tools={},
-                event_emitter=None,
-                default_timeout=None,
-            )
+    def test_constructor_uses_default_timeout_when_omitted(self):
+        executor = DynamicAgentExecutor(
+            llm_service=None,
+            tools={},
+            event_emitter=None,
+        )
         assert executor.default_timeout == 600
 
     def test_constructor_default_max_parallel(self):

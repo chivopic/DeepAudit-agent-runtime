@@ -111,6 +111,46 @@ def _node_span(runtime: GraphRuntime, node_name: str, **attrs: Any):
         return nullcontext()
 
 
+def _normalize_cwe(value: Any) -> Optional[str]:
+    """Normalize a model-supplied CWE to canonical ``CWE-<digits>`` form.
+
+    Models write "CWE-89", "cwe 89" or bare "89"; anything without a number is
+    dropped rather than guessed, since a wrong class would merge unrelated
+    findings during dedupe.
+    """
+    if value is None:
+        return None
+    import re
+
+    m = re.search(r"(\d+)", str(value))
+    return f"CWE-{m.group(1)}" if m else None
+
+
+def _parse_llm_findings(content: Optional[str]) -> list[dict[str, Any]]:
+    """Extract a findings list from a model reply.
+
+    Real models fence their JSON or prefix it with prose, so delegate to the
+    shared tolerant parser (markdown stripping + json-repair) instead of
+    requiring a bare leading "[". Accepts either a top-level array or an
+    object wrapping one under a conventional key.
+    """
+    text = (content or "").strip()
+    if not text:
+        return []
+
+    from app.services.agent.json_parser import AgentJsonParser
+
+    parsed = AgentJsonParser.parse_any(text, default=None)
+    if isinstance(parsed, dict):
+        for key in ("findings", "results", "issues", "vulnerabilities"):
+            if isinstance(parsed.get(key), list):
+                parsed = parsed[key]
+                break
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
 def _lang_for(path: str) -> Optional[str]:
     ext = Path(path).suffix.lower()
     return {
@@ -140,6 +180,10 @@ def _resolve_workspace(state: AuditState, runtime: GraphRuntime) -> Optional[Pat
         return None
     repo: RepositoryRef = req.repository
     if repo.local_path:
+        # Synthetic locators ("fixture://", "project://") name a source, not a
+        # directory — they are resolved during ingest, never opened as a path.
+        if "://" in repo.local_path:
+            return None
         return Path(repo.local_path)
     if runtime.extra.get("fixture_files"):
         # Synthetic workspace: files provided as {rel_path: content}
@@ -214,6 +258,18 @@ async def ingest_repository(state: AuditState, config: Optional[RunnableConfig] 
     req = state["request"]
     root = _resolve_workspace(state, runtime)
     fixture_files: dict[str, str] = dict(runtime.extra.get("fixture_files") or {})
+
+    # Materialising a real repository (clone / unzip) can take minutes, so the
+    # API hands us a resolver instead of doing it during the HTTP request.
+    # Ingest is the right phase for it, and later nodes read the root back off
+    # the runtime.
+    if root is None and not fixture_files:
+        resolver = runtime.extra.get("workspace_resolver")
+        if resolver is not None:
+            resolved = await resolver()
+            if resolved:
+                runtime.workspace_root = Path(resolved)
+                root = Path(resolved)
 
     file_count = 0
     total_bytes = 0
@@ -719,7 +775,9 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
                             role="system",
                             content=(
                                 "Return JSON array of findings "
-                                "[{title,description,severity,line}]."
+                                "[{title,description,severity,line,cwe}]. "
+                                "cwe must be a CWE id like 'CWE-89', or null "
+                                "when unsure."
                             ),
                         ),
                         LLMMessage(
@@ -736,46 +794,43 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
             usage = usage.add(resp.usage)
             tokens = resp.usage.total_tokens or 0
             budget = budget.consume_model_call(tokens=tokens)
-            # Parse optional structured findings from FakeLLM
-            text = (resp.content or "").strip()
-            if text.startswith("["):
+            # Parse optional structured findings. Real models wrap JSON in
+            # markdown fences or a prose preamble, so go through the shared
+            # tolerant parser rather than requiring a bare leading "[".
+            for item in _parse_llm_findings(resp.content):
+                line = int(item.get("line") or 1)
+                loc = SourceLocation(
+                    file_path=task.target_path,
+                    start_line=line,
+                    end_line=line,
+                )
+                sev_raw = str(item.get("severity") or "medium").lower()
                 try:
-                    arr = json.loads(text)
-                    for item in arr:
-                        line = int(item.get("line") or 1)
-                        loc = SourceLocation(
-                            file_path=task.target_path,
-                            start_line=line,
-                            end_line=line,
-                        )
-                        sev_raw = str(item.get("severity") or "medium").lower()
-                        try:
-                            sev = Severity(sev_raw)
-                        except ValueError:
-                            sev = Severity.MEDIUM
-                        candidates.append(
-                            CandidateFinding(
-                                title=str(item.get("title") or "LLM finding"),
-                                description=str(
-                                    item.get("description") or item.get("title") or ""
-                                ),
-                                severity=sev,
+                    sev = Severity(sev_raw)
+                except ValueError:
+                    sev = Severity.MEDIUM
+                candidates.append(
+                    CandidateFinding(
+                        title=str(item.get("title") or "LLM finding"),
+                        description=str(
+                            item.get("description") or item.get("title") or ""
+                        ),
+                        severity=sev,
+                        cwe_id=_normalize_cwe(item.get("cwe") or item.get("cwe_id")),
+                        location=loc,
+                        evidence=[
+                            Evidence(
+                                kind="model",
+                                summary="llm candidate",
                                 location=loc,
-                                evidence=[
-                                    Evidence(
-                                        kind="model",
-                                        summary="llm candidate",
-                                        location=loc,
-                                        confidence=0.55,
-                                    )
-                                ],
                                 confidence=0.55,
-                                analyzer="llm",
-                                source_task_id=task.id,
                             )
-                        )
-                except json.JSONDecodeError:
-                    pass
+                        ],
+                        confidence=0.55,
+                        analyzer="llm",
+                        source_task_id=task.id,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("analyze_file llm failed: %s", exc)
 
@@ -845,8 +900,79 @@ async def aggregate_findings(state: AuditState, config: Optional[RunnableConfig]
     }
 
 
+def _dedupe_key(f: Finding) -> Optional[tuple[str, int, str]]:
+    """Analyzer-independent identity: same file, same line, same CWE class.
+
+    Titles are free text — the model writes "OS Command Injection in ping()"
+    where the pattern scanner writes "OS Command Injection" — so a
+    title-derived fingerprint never merges the two reports of one flaw.
+    Returns ``None`` when the class is unknown, in which case the caller falls
+    back to the exact fingerprint rather than risk merging unrelated findings.
+    """
+    if not f.location or not f.location.file_path or not f.cwe_id:
+        return None
+    return (
+        f.location.file_path.replace("\\", "/").strip().lower(),
+        int(f.location.start_line or 0),
+        f.cwe_id.strip().upper(),
+    )
+
+
+def _merge_duplicate(keep: Finding, drop: Finding) -> Finding:
+    """Fold ``drop`` into ``keep``, losing no evidence.
+
+    Corroboration across analyzers is signal, so the merged confidence is the
+    higher of the two and both analyzers are recorded.
+    """
+    analyzers = [a for a in (keep.analyzer, drop.analyzer) if a]
+    merged_evidence = list(keep.evidence) + [
+        e for e in drop.evidence if e not in keep.evidence
+    ]
+    metadata = dict(keep.metadata)
+    merged_from = list(metadata.get("merged_from") or [])
+    for a in analyzers:
+        if a not in merged_from:
+            merged_from.append(a)
+    metadata["merged_from"] = merged_from
+    metadata["duplicate_count"] = int(metadata.get("duplicate_count") or 1) + 1
+
+    # Narrative fields come from the model when it contributed: it reads the
+    # surrounding code, so "SQL Injection via string-formatted query" beats the
+    # pattern scanner's generic "Possible SQL string". Classification fields
+    # still follow confidence.
+    narrator = next(
+        (f for f in (keep, drop) if (f.analyzer or "").startswith("llm")), keep
+    )
+
+    return keep.model_copy(
+        update={
+            "title": narrator.title,
+            "description": narrator.description or keep.description or drop.description,
+            "evidence": merged_evidence,
+            "confidence": max(keep.confidence, drop.confidence),
+            "severity": keep.severity
+            if _SEV_RANK.get(keep.severity, 0) >= _SEV_RANK.get(drop.severity, 0)
+            else drop.severity,
+            "recommendation": keep.recommendation or drop.recommendation,
+            "analyzer": "+".join(analyzers) if len(analyzers) > 1 else keep.analyzer,
+            "rule_id": keep.rule_id or drop.rule_id,
+            "metadata": metadata,
+        }
+    )
+
+
+def _prefer(a: Finding, b: Finding) -> tuple[Finding, Finding]:
+    """Order a duplicate pair as (keep, drop): higher confidence wins."""
+    return (a, b) if a.confidence >= b.confidence else (b, a)
+
+
 async def deduplicate_findings(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
-    """Dedupe by path + line + title/rule fingerprint."""
+    """Merge duplicate findings across analyzers.
+
+    Two passes: an exact fingerprint pass (identical reports), then a semantic
+    pass on file + line + CWE so the LLM and the pattern scanner reporting the
+    same flaw collapse into one corroborated finding instead of two.
+    """
     from app.services.agent.domain.mappers import fingerprint_components
 
     findings = list(state.get("normalized_findings") or [])
@@ -861,14 +987,34 @@ async def deduplicate_findings(state: AuditState, config: Optional[RunnableConfi
             cwe_id=f.cwe_id,
         )
         if fp in seen:
-            # Keep higher confidence
-            if f.confidence > seen[fp].confidence:
-                seen[fp] = f.model_copy(update={"fingerprint": fp})
+            keep, drop = _prefer(seen[fp], f.model_copy(update={"fingerprint": fp}))
+            seen[fp] = _merge_duplicate(keep, drop)
             continue
         seen[fp] = f.model_copy(update={"fingerprint": fp})
         order.append(fp)
 
-    deduped = [seen[k] for k in order]
+    # Semantic pass: same flaw, different wording.
+    by_class: dict[tuple[str, int, str], str] = {}
+    dropped: set[str] = set()
+    for fp in order:
+        f = seen[fp]
+        key = _dedupe_key(f)
+        if key is None:
+            continue
+        first_fp = by_class.get(key)
+        if first_fp is None:
+            by_class[key] = fp
+            continue
+        keep, drop = _prefer(seen[first_fp], f)
+        merged = _merge_duplicate(keep, drop)
+        # The survivor keeps the slot of whichever report came first.
+        seen[first_fp] = merged.model_copy(
+            update={"fingerprint": seen[first_fp].fingerprint}
+        )
+        seen[fp] = seen[fp].model_copy(update={"duplicate_of": merged.id})
+        dropped.add(fp)
+
+    deduped = [seen[k] for k in order if k not in dropped]
     return {
         "status": AuditStatus.AGGREGATING,
         "normalized_findings": deduped,

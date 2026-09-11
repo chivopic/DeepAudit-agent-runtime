@@ -6,6 +6,7 @@ Phase 1 graph is additive and does not replace the production ReAct path.
 from .state import AuditState, empty_audit_state
 from .builder import build_audit_graph, compile_audit_graph
 from .llm import FakeLLM, LLMGateway, LLMMessage, LLMResponse
+from .llm_gateway import LLMServiceGateway
 
 __all__ = [
     "AuditState",
@@ -16,4 +17,5 @@ __all__ = [
     "LLMGateway",
     "LLMMessage",
     "LLMResponse",
+    "LLMServiceGateway",
 ]

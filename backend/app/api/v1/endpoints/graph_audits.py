@@ -16,10 +16,14 @@ Trust boundary:
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import uuid
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -29,12 +33,38 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.project import Project, ProjectMember
 from app.models.user import User
-from app.services.agent.application import GraphAuditFacade, get_graph_facade
+from app.services.agent.application import (
+    GraphAuditFacade,
+    get_graph_event_bus,
+    get_graph_facade,
+)
 from app.services.agent.domain import AuditRequest, RepositoryRef, RunBudget
 from app.services.agent.graph.llm import FakeLLM
 from app.services.agent.graph.runtime import GraphRuntime
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+async def _resolve_llm(db: AsyncSession, user: User):
+    """Pick the graph LLM gateway.
+
+    Default is FakeLLM: this experimental surface must not reach paid APIs
+    unless GRAPH_AUDITS_USE_REAL_LLM is explicitly enabled. When it is, the
+    real gateway is built from the caller's own stored config, exactly as the
+    production ReAct path does — no credentials live in this module.
+    """
+    if not bool(getattr(settings, "GRAPH_AUDITS_USE_REAL_LLM", False)):
+        return FakeLLM(), True
+
+    # Imported lazily so the offline default path never pulls the LLM stack.
+    from app.api.v1.endpoints.agent_tasks import _get_user_config
+    from app.services.agent.graph.llm_gateway import LLMServiceGateway
+    from app.services.llm.service import LLMService
+
+    user_config = await _get_user_config(db, str(user.id))
+    return LLMServiceGateway(LLMService(user_config=user_config)), False
 
 
 class GraphAuditStartRequest(BaseModel):
@@ -45,6 +75,8 @@ class GraphAuditStartRequest(BaseModel):
     repository_url: Optional[str] = None
     local_path: Optional[str] = None
     source_type: str = Field(default="local")
+    # Branch to audit for source_type="project" (defaults to the project's own).
+    branch_name: Optional[str] = None
     languages: List[str] = Field(default_factory=list)
     include_paths: List[str] = Field(default_factory=list)
     exclude_paths: List[str] = Field(default_factory=list)
@@ -117,19 +149,29 @@ async def _assert_project_access(
     db: AsyncSession,
     user: User,
     project_id: Optional[str],
-) -> None:
-    """Optional DB project ACL (owner or member). No-op when flag off or no project_id."""
+    *,
+    require: bool = True,
+) -> Optional[Project]:
+    """DB project ACL (owner or member); returns the Project when checked.
+
+    ``require=False`` keeps the legacy opt-in behaviour driven by
+    GRAPH_AUDITS_ENFORCE_PROJECT_ACL. Callers that are about to read the
+    project's actual source must pass ``require=True`` so the check can never
+    be switched off by configuration.
+    """
     if not project_id:
-        return
-    if not bool(getattr(settings, "GRAPH_AUDITS_ENFORCE_PROJECT_ACL", False)):
-        return
+        return None
+    if not require and not bool(
+        getattr(settings, "GRAPH_AUDITS_ENFORCE_PROJECT_ACL", False)
+    ):
+        return None
     project = await db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     if getattr(user, "is_superuser", False):
-        return
+        return project
     if project.owner_id == user.id:
-        return
+        return project
     result = await db.execute(
         select(ProjectMember).where(
             ProjectMember.project_id == project_id,
@@ -139,6 +181,54 @@ async def _assert_project_access(
     member = result.scalars().first()
     if member is None:
         raise HTTPException(status_code=403, detail="无权访问此项目")
+    return project
+
+
+async def _build_project_workspace_resolver(
+    db: AsyncSession,
+    user: User,
+    project: Project,
+    audit_id: str,
+    branch: Optional[str],
+):
+    """Return an async callable that materialises ``project`` server-side.
+
+    Everything needing the request-scoped DB session is read here, eagerly.
+    The returned closure performs only the clone/unzip, so it can run later in
+    the graph's ingest phase after the HTTP response has been sent.
+
+    The client never supplies a path: the location is derived entirely from the
+    stored Project record, exactly as the production ReAct path does.
+    """
+    from app.api.v1.endpoints.agent_tasks import _get_project_root, _get_user_config
+    from app.core.encryption import decrypt_sensitive_data
+
+    user_config = await _get_user_config(db, str(user.id)) or {}
+    other_config = user_config.get("otherConfig", {}) or {}
+
+    github_token = other_config.get("githubToken") or settings.GITHUB_TOKEN
+    gitlab_token = other_config.get("gitlabToken") or settings.GITLAB_TOKEN
+    gitea_token = other_config.get("giteaToken") or settings.GITEA_TOKEN
+
+    ssh_private_key = None
+    if "sshPrivateKey" in other_config:
+        try:
+            ssh_private_key = decrypt_sensitive_data(other_config["sshPrivateKey"])
+        except Exception as exc:  # noqa: BLE001 — never fail a run on key decode
+            logger.warning("graph-audit ssh key decrypt failed: %s", exc)
+
+    async def _resolve() -> Optional[str]:
+        return await _get_project_root(
+            project,
+            audit_id,
+            branch,
+            github_token=github_token,
+            gitlab_token=gitlab_token,
+            gitea_token=gitea_token,
+            ssh_private_key=ssh_private_key,
+        )
+
+    return _resolve
 
 
 async def _assert_audit_owner(task_id: str, user: User) -> dict[str, Any]:
@@ -168,7 +258,7 @@ async def start_graph_audit(
 ) -> Any:
     """Start a LangGraph audit (async by default; optional sync wait for tests)."""
     _ensure_enabled()
-    await _assert_project_access(db, current_user, body.project_id)
+    await _assert_project_access(db, current_user, body.project_id, require=False)
 
     fixture_files = dict(body.fixture_files or {})
     fixture_only = bool(getattr(settings, "GRAPH_AUDITS_FIXTURE_ONLY", True))
@@ -180,7 +270,42 @@ async def start_graph_audit(
             "git source_type is not enabled on graph-audits (use fixture_files offline)",
         )
 
-    if fixture_only:
+    workspace_resolver = None
+    if body.source_type == "project":
+        # Audit a real repository without ever trusting a client path: the
+        # location comes from the stored Project record, and the ACL check here
+        # is mandatory (it cannot be disabled by configuration).
+        if not bool(getattr(settings, "GRAPH_AUDITS_ALLOW_PROJECT_SOURCE", True)):
+            raise HTTPException(
+                400,
+                "project source_type is disabled "
+                "(GRAPH_AUDITS_ALLOW_PROJECT_SOURCE=false)",
+            )
+        if not body.project_id:
+            raise HTTPException(400, 'project_id is required for source_type="project"')
+
+        project = await _assert_project_access(
+            db, current_user, body.project_id, require=True
+        )
+        assert project is not None  # _assert_project_access raises otherwise
+
+        repo = RepositoryRef(
+            source_type="local",
+            # Server-derived locator; the real path is resolved during ingest.
+            local_path=f"project://{body.project_id}",
+            url=project.repository_url,
+            branch=body.branch_name or project.default_branch,
+            metadata={"server_resolved": True, "project_id": body.project_id},
+        )
+        resolver_audit_id = f"graph-{uuid.uuid4().hex[:12]}"
+        workspace_resolver = await _build_project_workspace_resolver(
+            db,
+            current_user,
+            project,
+            resolver_audit_id,
+            body.branch_name or project.default_branch,
+        )
+    elif fixture_only:
         if body.local_path and _is_absolute_or_host_path(body.local_path):
             raise HTTPException(
                 400,
@@ -226,12 +351,16 @@ async def start_graph_audit(
         ),
         enable_verification=False,
     )
-    # Dual-path experimental route: FakeLLM only until ModelRouter is wired to
-    # the production LLM gateway. Never hit paid APIs from this surface.
+    # Dual-path experimental route. FakeLLM by default; the real gateway only
+    # when GRAPH_AUDITS_USE_REAL_LLM is set (see _resolve_llm).
+    llm, offline = await _resolve_llm(db, current_user)
     runtime = GraphRuntime(
-        llm=FakeLLM(),
-        offline=True,
-        extra={"fixture_files": fixture_files},
+        llm=llm,
+        offline=offline,
+        extra={
+            "fixture_files": fixture_files,
+            "workspace_resolver": workspace_resolver,
+        },
     )
 
     wait = bool(body.wait) and bool(getattr(settings, "GRAPH_AUDITS_SYNC_START", False))
@@ -304,6 +433,51 @@ async def list_graph_events(
     _ensure_enabled()
     await _assert_audit_owner(task_id, current_user)
     return await _facade().list_events(task_id)
+
+
+@router.get("/{task_id}/events/stream")
+async def stream_graph_events(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_user),
+):
+    """Server-sent events for a running graph audit.
+
+    Field shapes mirror ``/agent-tasks/{id}/events`` so the existing frontend
+    stream handling works unchanged: each frame is ``data: {json}`` carrying an
+    AgentEvent-shaped payload, and the stream ends with a ``task_end`` frame.
+    """
+    _ensure_enabled()
+    await _assert_audit_owner(task_id, current_user)
+
+    bus = get_graph_event_bus()
+
+    async def event_generator():
+        # The bus already emits agent-tasks-shaped frames (graph_event_to_sse
+        # maps graph "kind" onto the AgentEvent "type" vocabulary), so frames
+        # pass through untouched and the terminal check reads "type".
+        terminal = {"task_complete", "task_error", "task_cancel"}
+        try:
+            async for event in bus.subscribe(task_id):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event.get("type") in terminal:
+                    break
+        except asyncio.CancelledError:  # client disconnected
+            raise
+        except Exception as exc:  # noqa: BLE001 — never leak a traceback to SSE
+            logger.warning("graph-audit event stream failed: %s", exc)
+            yield f"data: {json.dumps({'type': 'error'})}\n\n"
+        finally:
+            yield f"data: {json.dumps({'type': 'task_end', 'task_id': task_id})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/{task_id}/start")

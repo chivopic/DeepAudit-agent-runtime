@@ -46,7 +46,153 @@ uv run pytest \
 # 2026-07-24 post Codex Phase 0/1: **128 passed**
 # 2026-07-24 node tools/tracer/budget wiring: **129 passed**
 # 2026-07-24 graph-audits JWT auth: **131 passed** (agent suite)
+# 2026-09-11 re-verified unchanged: **131 passed**
+# 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
+
+## Usable graph path: dedupe, real repositories, frontend API (2026-09-11)
+
+Follow-up to the LLM wiring below, closing the three gaps it left open.
+
+### 1. Cross-analyzer de-duplication
+
+One flaw was reported twice — once by the model, once by the pattern scanner —
+because the fingerprint included the free-text title ("OS Command Injection in
+ping()" vs "OS Command Injection").
+
+`deduplicate_findings` now runs two passes: the existing exact-fingerprint pass,
+then a semantic pass keyed on **file + line + CWE**. To make that key exist, the
+analyze prompt asks the model for a `cwe` field, normalised through
+`_normalize_cwe` ("cwe 78", `78`, "CWE-78" → `CWE-78`; anything without a number
+is dropped rather than guessed).
+
+Merging loses nothing: evidence from both analyzers is unioned, confidence and
+severity take the stronger assessment, `analyzer` becomes `heuristic+llm`, and
+`metadata.merged_from` records the contributors. Narrative fields come from the
+model, which reads surrounding code; classification follows confidence.
+
+Findings without a CWE are never merged — a wrong merge would silently delete a
+real finding.
+
+### 2. Real repositories, without trusting a client path
+
+New `source_type="project"`:
+
+- requires `project_id`, and the project ACL check is **mandatory** — passing
+  `require=True` means `GRAPH_AUDITS_ENFORCE_PROJECT_ACL=false` cannot weaken it;
+- the workspace is derived entirely from the stored Project record and
+  materialised by the same `_get_project_root` the production ReAct path uses;
+- the client still cannot name a path: `local_path` remains rejected, and the
+  request carries only a synthetic `project://<id>` locator.
+
+Cloning a repository can take minutes, so it runs in the graph's **ingest**
+phase via a `workspace_resolver` closure rather than during the HTTP request.
+Everything needing the request-scoped DB session is read eagerly while building
+that closure. `_resolve_workspace` now treats any `scheme://` locator as "not a
+directory", which also hardens the pre-existing fixture path.
+
+`GRAPH_AUDITS_FIXTURE_ONLY` is unchanged and still governs the `local_path`
+branch.
+
+### 3. Frontend API layer + SSE
+
+- `frontend/src/shared/api/graphAudits.ts`: typed client (start / get / cancel /
+  resume / findings / events / stream URL), 9 tests.
+- New backend endpoint `GET /api/v1/graph-audits/{id}/events/stream`. The event
+  bus already emits AgentEvent-shaped frames (`graph_event_to_sse` maps the
+  graph's `kind` onto the `type` vocabulary), so the existing frontend stream
+  handling works unchanged.
+
+**Deliberately NOT done:** the AgentAudit page is not switched over.
+`src/pages/AgentAudit/index.tsx` depends on agent-tasks-only endpoints
+(`getAgentTree`, `getAgentCheckpoints`, report export) that graph-audits does
+not implement; an engine switch today would route users to a page missing those
+panels. Needs graph-audits equivalents or a dedicated results view — a product
+decision, not a code gap.
+
+### Verified against a real model
+
+Same DeepSeek fixture as below, after de-duplication:
+
+```text
+STATUS: completed | tokens_used: 1922
+FINDINGS: 3          (was 6 for the same 3 planted flaws)
+  heuristic+llm | critical | SQL Injection via string-formatted query   | line 6
+  heuristic+llm | critical | OS Command Injection in ping()             | line 10
+  heuristic+llm | critical | Insecure Deserialization via pickle.loads  | line 13
+```
+
+Agent gate: **183 passed**. Full backend suite: **1134 passed, 8 skipped, 0
+failed**. Frontend: **340 passed**.
+
+## Real LLM wiring for the graph path (2026-09-11)
+
+The LangGraph path was hard-wired to `FakeLLM`, so it could run a graph but
+could not actually audit anything. It now reaches the production LLM gateway —
+**behind a default-off flag**.
+
+| Change | Detail |
+|--------|--------|
+| `graph/llm_gateway.py` | New `LLMServiceGateway` implements the `LLMGateway` protocol over `app.services.llm.LLMService`. Credentials are never held here: `LLMService` resolves them per user from stored config, as the ReAct path does. |
+| `GRAPH_AUDITS_USE_REAL_LLM` | New setting, **default `False`**. `_resolve_llm()` returns `FakeLLM` (offline) unless explicitly enabled, so this surface still cannot reach paid APIs by default. |
+| Tolerant findings parsing | `analyze_file` only parsed findings when the reply started with `[`. Real models fence JSON in ```` ```json ````, so **every LLM finding was being silently dropped**. Now goes through the shared `AgentJsonParser.parse_any` (fence stripping + json-repair); also unwraps `{findings: [...]}`. |
+| CI | `tests/test_agent_llm_gateway.py` (18 tests) added to the gate. |
+
+### Verified against a real model (out of band, not a committed test)
+
+DeepSeek `deepseek-chat`, small Python fixture with three planted flaws:
+
+```text
+STATUS: completed | tokens_used: 1329
+FINDINGS: 6
+  llm       | critical | SQL Injection via string-formatted query    | line 6
+  llm       | critical | OS Command Injection in ping()              | line 10
+  llm       | critical | Insecure Deserialization with pickle.loads  | line 13
+  heuristic | high     | OS Command Injection                        | line 10
+  heuristic | high     | Insecure Deserialization                    | line 13
+  heuristic | medium   | Possible SQL string                         | line 6
+```
+
+Token accounting flows into `RunBudget`, and Phase 1 invariant 1 holds
+(`verification_status=not_run` on every finding).
+
+**Still open after this change:**
+
+- `GRAPH_AUDITS_FIXTURE_ONLY` remains `True`, so the *route* still accepts only
+  inline fixtures. Real-repository auditing over HTTP needs that trust boundary
+  reopened deliberately — untouched here.
+- Findings are not de-duplicated: the LLM and the heuristic tool report the same
+  flaw twice (6 findings for 3 flaws above).
+- Frontend still does not call `/api/v1/graph-audits/*`. Production remains ReAct.
+
+## Legacy suite repair (2026-09-11)
+
+The M0–M11 gate was green, but the **full** backend suite was not: 8 tests
+failed. All 8 predated the agent-runtime work (reproduced on `main`), so they
+were latent, not regressions. Now fixed:
+
+```bash
+cd backend && uv run pytest -q
+# 2026-09-11: **1082 passed, 8 skipped, 0 failed**
+# 2026-09-11 after real-LLM wiring: **1100 passed, 8 skipped, 0 failed**
+```
+
+| Fix | Detail |
+|-----|--------|
+| `BaseAgent._cancel_callback` | Initialiser had slipped into the body of `cancel()`, so the attribute only existed after `cancel()`/`set_cancel_callback()` had been called; any earlier `is_cancelled` read raised `AttributeError` and aborted the run. Moved to `__init__` beside `_cancelled`. |
+| `tests/test_executor.py` | Dropped a stub patching `executor.get_agent_config`, a config fallback that no longer exists; the test now asserts the real contract (`default_timeout` defaults to 600). |
+| `tests/test_event_manager_deep.py` | Dropped two stubs patching `event_manager.get_agent_config` (SSE heartbeat is now a hard-coded 30s). Sequence filtering is asserted via a terminal event; the queue fallback via a short `wait_for`. |
+
+**Compatibility impact:** `base.py` is on the production ReAct path. Production
+was masked from the bug because the only construction site
+(`agent_tasks.py:455-459`) always calls `set_cancel_callback` before running;
+the fix removes that ordering dependency. No signature or API change.
+
+**Not addressed** (unchanged, still open): graph-audits is hard-wired to
+`FakeLLM` (`graph_audits.py:232`) and defaults to `GRAPH_AUDITS_FIXTURE_ONLY`,
+so the LangGraph path cannot audit a real repository; the frontend does not
+call `/api/v1/graph-audits/*` at all. Production remains ReAct (K1). Repo-wide
+Ruff/Black/MyPy remain unclean on legacy code and are not gated by CI.
 
 ## Post-M11 audit hardening (same day)
 

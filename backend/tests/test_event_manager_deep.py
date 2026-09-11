@@ -8,7 +8,7 @@ and error handling.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -498,22 +498,17 @@ class TestEventManagerStreamEvents:
             await manager.add_event(
                 task_id="t1", event_type="info", sequence=i + 1
             )
+        # Terminal event so the stream returns after draining the buffer
+        # instead of blocking on the real-time loop's heartbeat timeout.
+        await manager.add_event(task_id="t1", event_type="task_complete", sequence=6)
 
         events = []
-        with patch(
-            "app.services.agent.event_manager.get_agent_config"
-        ) as mock_cfg:
-            mock_cfg.return_value.sse_heartbeat_interval_seconds = 0.01
-            async for event in manager.stream_events("t1", after_sequence=3):
-                # Heartbeats don't have sequence, skip them
-                if event.get("event_type") == "heartbeat":
-                    break
-                events.append(event)
+        async for event in manager.stream_events("t1", after_sequence=3):
+            events.append(event)
 
-        # Only sequences 4 and 5 should pass
-        assert len(events) == 2
-        for e in events:
-            assert e["sequence"] > 3
+        # Only sequences 4, 5 and the terminal event 6 should pass
+        assert [e["sequence"] for e in events] == [4, 5, 6]
+        assert events[-1]["event_type"] == "task_complete"
 
     @pytest.mark.asyncio
     async def test_stream_stops_on_task_complete(self):
@@ -535,20 +530,18 @@ class TestEventManagerStreamEvents:
     async def test_stream_creates_queue_if_missing(self):
         """When no queue exists, a new one is created (fallback)."""
         manager = EventManager()
-        events = []
-        # This will create a queue but the stream will hit timeout immediately
-        # because no events are added. We use a short timeout.
-        with patch(
-            "app.services.agent.event_manager.get_agent_config"
-        ) as mock_cfg:
-            mock_cfg.return_value.sse_heartbeat_interval_seconds = 0.01
-            async for event in manager.stream_events("t-missing"):
-                events.append(event)
-                break  # Only need to verify it yields at least a heartbeat
+        assert "t-missing" not in manager._event_queues
 
-        # Either got a heartbeat or timed out -- either way, no crash
-        if events:
-            assert events[0]["event_type"] == "heartbeat"
+        stream = manager.stream_events("t-missing")
+        try:
+            # No events are queued, so the stream blocks in the real-time loop
+            # until its heartbeat timeout; we only need it to get that far.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(stream.__anext__(), timeout=0.1)
+
+            assert "t-missing" in manager._event_queues
+        finally:
+            await stream.aclose()
 
 
 # ======================================================================
