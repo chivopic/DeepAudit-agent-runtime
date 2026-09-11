@@ -72,35 +72,49 @@ preconditions, marks the run `DEGRADED` and **withholds the verdict**. A
 benchmark that quietly reports a degraded baseline is worse than no benchmark:
 it would "prove" whatever the newer engine happens to do.
 
-### First run (NOT a verdict)
+### Results after restoring ReAct's scanners
+
+The first run had ReAct crippled — no RAG *and* no external scanners. Semgrep
+and Bandit were restored (a stand-in sandbox image; the shipped Dockerfile
+cannot build in this environment) and the benchmark re-run.
 
 ```text
-graph   recall 14/14 (100.0%)  findings 23  FP(safe) 5  unmatched 4  tokens  6836   41.6s
-react   recall  8/14 ( 57.1%)  findings 16  FP(safe) 0  unmatched 8  tokens 19078  144.5s
-        ⚠ DEGRADED — ran without embeddings and without the sandbox image
-VERDICT WITHHELD
+graph   recall 14/14 (100.0%)  findings 21  FP(safe) 3  unmatched 4  tokens  6172   37.6s
+react   recall  8/14 ( 57.1%)  findings 16  FP(safe) 0  unmatched 8  tokens 23588  115.5s
+        ⓘ RAG still off — treat ReAct's recall as a lower bound
 ```
 
-ReAct ran without RAG and without its external scanners, so this says nothing
-about which engine is better. What it does establish: the harness works, and
-the graph path's floor competence on single-file patterns is solid and cheap.
+Restoring Semgrep moved ReAct from 8/14 to 10/14 on one run — and back to 8/14
+on the next. Which is the headline finding:
+
+| engine | recall across 3 identical runs |
+|--------|-------------------------------|
+| graph | 14, 14, 14 — stable |
+| react | 8, 10, 8 — a spread of 2 labels |
+
+**ReAct is erratic on this corpus; the graph path is not.** The graph path's
+false positives still moved (3–5 across runs), but its recall did not. The
+runner now takes `--repeat` and prints the spread, because a single ReAct run
+is a coin toss rather than a measurement.
 
 The graph path's false positives were all from the built-in heuristic pattern
-scanner (`Possible SQL string` on parameterised queries), not from the model.
+scanner (`Possible SQL string` on parameterised queries) or from the model
+flagging mitigations as findings — not from missing a real flaw. ReAct scored 0
+false positives in every run: it is consistently the more conservative engine.
 
-### Known limits, recorded so the numbers are not over-read
+### This corrects an earlier assumption in this file
 
-- **Single runs are noisy.** Model nondeterminism moved the graph engine's
-  false positives between 2 and 5 across two runs of an identical corpus.
-- **The corpus tests single-file patterns**, which flatters a per-file
-  analyser. One cross-file case exists (an incomplete sanitiser) but the sink
-  is still visibly concatenated, so multi-file reasoning is not yet isolated.
-- **Detection only.** Verification quality is not scored — the graph path is
-  Phase 1 and always reports `NOT_RUN`.
+The dual-path notes assumed the graph path would be a clear regression because
+it makes one truncated LLM call per file. On single-file patterns that is not
+what the data shows: it detects more, more consistently, at roughly a quarter
+of the tokens and a third of the wall time.
 
-**Before any switch decision:** a full-strength ReAct run (embeddings + sandbox
-image), repeated runs to average out nondeterminism, and cross-file cases that
-actually isolate dataflow reasoning.
+That is **not** a case for switching. This corpus is the easy case and flatters
+a per-file analyser; it does not test the multi-file dataflow reasoning where
+an iterative agent should win, and it does not score verification at all.
+
+**Before any switch decision:** cross-file cases that actually isolate dataflow
+reasoning, a ReAct run with RAG enabled, and `--repeat` on everything.
 
 ## K2 closed: docker.sock off the API (2026-09-11)
 

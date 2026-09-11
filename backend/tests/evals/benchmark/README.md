@@ -5,8 +5,11 @@ well as the production ReAct path, and at what cost?
 
 ```bash
 cd backend
-uv run python -m tests.evals.benchmark.run_benchmark --engines graph,react
+uv run python -m tests.evals.benchmark.run_benchmark --engines graph,react --repeat 3
 ```
+
+**Use `--repeat 3` or more.** Both engines are nondeterministic, and ReAct
+badly so — see "Known limits".
 
 Not part of the default test run — it needs a real model and spends tokens.
 The scoring rules are unit-tested in `backend/tests/test_benchmark_scorer.py`.
@@ -36,20 +39,35 @@ reliably they emit CWEs).
 
 ## Preconditions, and why the runner can refuse to answer
 
-ReAct depends on an embedding provider (RAG) and on the sandbox image
-(Semgrep, Bandit, Gitleaks). Run it without those and it is a crippled engine —
-so the runner checks for them, labels the run `DEGRADED`, and **withholds the
-verdict** rather than printing numbers that would "prove" the new engine wins.
+ReAct depends on external scanners (Semgrep, Bandit, Gitleaks — all inside the
+sandbox image) and on an embedding provider for RAG. Run it without those and
+it is a weakened engine, so the runner checks and splits what it finds:
+
+* **Blocking** — the sandbox image or Docker is missing, so the external
+  scanners never ran. The run is labelled `DEGRADED` and the verdict is
+  **withheld**. Restoring Semgrep moved ReAct from 8/14 to 10/14 on one run,
+  so this is not a formality.
+* **Advisory** — no embedding provider, so RAG code search is off. RAG helps
+  the agent decide *where* to look in a large repository; on a corpus this
+  small it can enumerate every file directly. The run still reports, with
+  ReAct's recall flagged as a lower bound.
 
 A benchmark that quietly reports a degraded baseline is worse than no
-benchmark. If you see `VERDICT WITHHELD`, fix the preconditions and re-run.
+benchmark: it would "prove" whatever the newer engine happens to do.
 
 ## Known limits
 
-- **Single-run results are noisy.** Model nondeterminism moved the graph
-  engine's false positives between 2 and 5 across two runs of an identical
-  corpus. Treat one run as a smoke reading, not a measurement; repeat before
-  concluding anything.
+- **Single-run results are noisy, and unevenly so.** Across identical runs of
+  the same corpus:
+
+  | engine | recall over 3 runs |
+  |--------|--------------------|
+  | graph | 14, 14, 14 — stable |
+  | react | 8, 10, 8 — a spread of 2 labels |
+
+  The graph path's false positives still moved (3–5), but its recall did not.
+  ReAct's did. One run of ReAct is a coin toss, not a measurement — which is
+  why `--repeat` exists and why the runner prints the spread.
 - **The corpus tests single-file patterns.** That is the easy case, and it
   flatters a per-file analyser. `vulnerable/reports.py` plus
   `vulnerable/sanitize_util.py` is a first cross-file case (the sanitiser only

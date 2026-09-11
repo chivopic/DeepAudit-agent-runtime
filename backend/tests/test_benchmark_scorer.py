@@ -131,3 +131,18 @@ def test_every_safe_path_exists():
 
 def test_corpus_has_negatives_or_false_positives_are_unmeasurable():
     assert len(CORPUS.safe_paths) >= 8
+
+
+def test_advisory_gaps_are_separate_from_blocking_ones():
+    """Not every missing capability invalidates a run to the same degree.
+
+    A missing scanner means findings were never looked for (blocking). A
+    missing embedding provider means retrieval was weaker (advisory). Only the
+    first withholds the verdict.
+    """
+    s = score("react", [], CORPUS.vulnerable, CORPUS.safe_paths)
+    assert s.degraded == []
+    assert s.advisory == []
+
+    s.advisory = ["RAG disabled"]
+    assert s.advisory and not s.degraded
