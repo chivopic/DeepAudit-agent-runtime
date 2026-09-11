@@ -50,6 +50,81 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Usable graph path: dedupe, real repositories, frontend API (2026-09-11)
+
+Follow-up to the LLM wiring below, closing the three gaps it left open.
+
+### 1. Cross-analyzer de-duplication
+
+One flaw was reported twice — once by the model, once by the pattern scanner —
+because the fingerprint included the free-text title ("OS Command Injection in
+ping()" vs "OS Command Injection").
+
+`deduplicate_findings` now runs two passes: the existing exact-fingerprint pass,
+then a semantic pass keyed on **file + line + CWE**. To make that key exist, the
+analyze prompt asks the model for a `cwe` field, normalised through
+`_normalize_cwe` ("cwe 78", `78`, "CWE-78" → `CWE-78`; anything without a number
+is dropped rather than guessed).
+
+Merging loses nothing: evidence from both analyzers is unioned, confidence and
+severity take the stronger assessment, `analyzer` becomes `heuristic+llm`, and
+`metadata.merged_from` records the contributors. Narrative fields come from the
+model, which reads surrounding code; classification follows confidence.
+
+Findings without a CWE are never merged — a wrong merge would silently delete a
+real finding.
+
+### 2. Real repositories, without trusting a client path
+
+New `source_type="project"`:
+
+- requires `project_id`, and the project ACL check is **mandatory** — passing
+  `require=True` means `GRAPH_AUDITS_ENFORCE_PROJECT_ACL=false` cannot weaken it;
+- the workspace is derived entirely from the stored Project record and
+  materialised by the same `_get_project_root` the production ReAct path uses;
+- the client still cannot name a path: `local_path` remains rejected, and the
+  request carries only a synthetic `project://<id>` locator.
+
+Cloning a repository can take minutes, so it runs in the graph's **ingest**
+phase via a `workspace_resolver` closure rather than during the HTTP request.
+Everything needing the request-scoped DB session is read eagerly while building
+that closure. `_resolve_workspace` now treats any `scheme://` locator as "not a
+directory", which also hardens the pre-existing fixture path.
+
+`GRAPH_AUDITS_FIXTURE_ONLY` is unchanged and still governs the `local_path`
+branch.
+
+### 3. Frontend API layer + SSE
+
+- `frontend/src/shared/api/graphAudits.ts`: typed client (start / get / cancel /
+  resume / findings / events / stream URL), 9 tests.
+- New backend endpoint `GET /api/v1/graph-audits/{id}/events/stream`. The event
+  bus already emits AgentEvent-shaped frames (`graph_event_to_sse` maps the
+  graph's `kind` onto the `type` vocabulary), so the existing frontend stream
+  handling works unchanged.
+
+**Deliberately NOT done:** the AgentAudit page is not switched over.
+`src/pages/AgentAudit/index.tsx` depends on agent-tasks-only endpoints
+(`getAgentTree`, `getAgentCheckpoints`, report export) that graph-audits does
+not implement; an engine switch today would route users to a page missing those
+panels. Needs graph-audits equivalents or a dedicated results view — a product
+decision, not a code gap.
+
+### Verified against a real model
+
+Same DeepSeek fixture as below, after de-duplication:
+
+```text
+STATUS: completed | tokens_used: 1922
+FINDINGS: 3          (was 6 for the same 3 planted flaws)
+  heuristic+llm | critical | SQL Injection via string-formatted query   | line 6
+  heuristic+llm | critical | OS Command Injection in ping()             | line 10
+  heuristic+llm | critical | Insecure Deserialization via pickle.loads  | line 13
+```
+
+Agent gate: **183 passed**. Full backend suite: **1134 passed, 8 skipped, 0
+failed**. Frontend: **340 passed**.
+
 ## Real LLM wiring for the graph path (2026-09-11)
 
 The LangGraph path was hard-wired to `FakeLLM`, so it could run a graph but

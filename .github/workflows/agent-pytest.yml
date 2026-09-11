@@ -46,6 +46,8 @@ jobs:
             tests/test_agent_evals_m10.py \
             tests/test_agent_harness_m11.py \
             tests/test_agent_llm_gateway.py \
+            tests/test_agent_dedupe.py \
+            tests/test_agent_project_source.py \
             -q --tb=short
 
       - name: Run eval CI suite
