@@ -50,6 +50,50 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Checkpointing made real: Postgres backend and true resume (2026-09-11)
+
+`MemorySaver` is a dict. It was the default in the runner's constructor, so
+every milestone since M3 ran with checkpoints that died with the process — and
+`resume()` only read finished state back rather than continuing, which its own
+comment admitted (*"M3: full re-invoke; M4+ may continue mid-graph"*).
+
+### What changed
+
+| Piece | Detail |
+|-------|--------|
+| Postgres backend | `AsyncPostgresSaver` over a psycopg pool, tables created on first use. The backend now comes from `AGENT_CHECKPOINT_BACKEND` instead of being pinned to `"memory"` in the constructor. |
+| DSN handling | The app speaks SQLAlchemy (`postgresql+asyncpg://`); psycopg cannot parse that, so the dialect prefix is stripped and non-Postgres URLs are refused rather than mangled. |
+| `resume` | When the checkpoint has un-run nodes, `ainvoke(None, cfg)` continues from it; a resumed run is persisted through the same `_persist` path as a fresh one, so the recovery path cannot drift from the normal one. |
+
+### Failing loudly vs. degrading quietly
+
+`postgres` is explicit and **fails hard** if the database is unreachable:
+asking for durability and silently getting a dict is how a crash turns into
+lost work.
+
+`auto` is best-effort — it falls back to memory — but logs a WARNING saying
+checkpoints will not survive a restart. Connect timeouts are 5s, not the
+driver's 30s, and an unreachable DSN is remembered per-process so the next
+runner fails over immediately instead of paying the timeout again. That last
+detail is not cosmetic: without it the test suite went from 16s to 5m20s.
+
+### Verified
+
+```text
+cross-process   a child process writes checkpoints, is killed, and this
+                process reads them back — impossible with MemorySaver
+resume          interrupted at aggregate_findings (next=('aggregate_findings',),
+                0 findings) → runner.resume() → COMPLETED, 5 findings
+```
+
+**A note on method.** The first attempts at the resume test killed a child
+process to create an interrupted checkpoint, and produced nonsense: `kill -9`
+on the `uv run` wrapper orphaned the real Python process, which kept running
+and finished the audit. Three readings that looked like "resume does not fire"
+were actually reads of completed threads. The test now creates the interrupted
+state deterministically with `interrupt_before` — an unreliable setup makes an
+unreliable test, whatever it appears to prove.
+
 ## Process: the repeated defect, and three guards against it (2026-09-11)
 
 Four features in this repository were built, tested, marked **Done**, and never
@@ -716,7 +760,7 @@ harness/          # M11 AgentSpec + AgentRuntime
 | K1 | Production still ReAct by default | Medium (intentional dual-path) |
 | K2 | ~~docker.sock on API compose~~ | **Fixed** 2026-09-11 (sandbox worker) |
 | K4 | Cancel mid-flight is cooperative/in-process | Medium |
-| K5 | Memory checkpointer default | Medium (dev) |
+| K5 | ~~Memory checkpointer default~~ | **Fixed** 2026-09-11 (Postgres backend + real resume) |
 | K8 | CI now runs the full suite + smoke + evals | **Fixed** 2026-09-11 |
 | K11 | M11 harness unreferenced by production (ModelRouter dead) | Medium — wire or drop |
 | K9 | ~~GraphRecursionError over ~20 files~~ | **Fixed** 2026-09-11 |

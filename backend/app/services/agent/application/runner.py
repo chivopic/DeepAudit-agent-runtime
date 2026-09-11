@@ -25,7 +25,10 @@ from app.services.agent.persistence.business_store import (
     InMemoryBusinessStore,
     PersistedAuditRecord,
 )
-from app.services.agent.persistence.checkpointer import create_checkpointer
+from app.services.agent.persistence.checkpointer import (
+    acreate_checkpointer,
+    create_checkpointer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,20 +106,42 @@ class AuditRunner:
         store: Optional[BusinessAuditStore] = None,
         artifacts: Optional[ArtifactStore] = None,
         checkpointer: Any = None,
-        checkpointer_backend: str = "memory",
+        checkpointer_backend: Optional[str] = None,
     ) -> None:
         self.store: BusinessAuditStore = store or InMemoryBusinessStore()
         self.artifacts: ArtifactStore = artifacts or InMemoryArtifactStore()
         self._checkpointer = checkpointer
-        self._checkpointer_backend = checkpointer_backend
+        # Default comes from configuration rather than being pinned to
+        # "memory" in the constructor — that pin is why production ran with an
+        # in-process dict for every milestone since M3.
+        self._checkpointer_backend = checkpointer_backend or getattr(
+            settings, "AGENT_CHECKPOINT_BACKEND", "auto"
+        )
         self._cancel_flags: dict[str, bool] = {}
         self._compiled = None
 
+    async def _aget_graph(self):
+        """Compile once, opening the checkpointer's pool if it needs one.
+
+        Postgres is async to construct, so compilation moved behind an await.
+        """
+        if self._compiled is None:
+            cp = self._checkpointer
+            if cp is None:
+                cp = await acreate_checkpointer(
+                    backend=self._checkpointer_backend,  # type: ignore[arg-type]
+                )
+            self._checkpointer = cp
+            self._compiled = compile_audit_graph(checkpointer=cp)
+        return self._compiled
+
     def _graph(self):
+        """Synchronous compile. Memory/sqlite only — kept for existing callers."""
         if self._compiled is None:
             cp = self._checkpointer or create_checkpointer(
                 backend=self._checkpointer_backend  # type: ignore[arg-type]
             )
+            self._checkpointer = cp
             self._compiled = compile_audit_graph(checkpointer=cp)
         return self._compiled
 
@@ -151,7 +176,7 @@ class AuditRunner:
 
         token = set_runtime(runtime)
         try:
-            app = self._graph()
+            app = await self._aget_graph()
             result = await app.ainvoke(
                 state,
                 {
@@ -180,6 +205,17 @@ class AuditRunner:
         finally:
             reset_runtime(token)
 
+        return await self._persist(aid, result)
+
+    async def _persist(
+        self, aid: str, result: dict[str, Any], *, resumed: bool = False
+    ) -> AuditRunResult:
+        """Turn a finished graph state into a stored record.
+
+        Shared by ``run`` and ``resume`` so a resumed run is persisted exactly
+        like a fresh one — two copies of this would drift, and the drift would
+        only show up on the recovery path nobody exercises.
+        """
         status = result.get("status") or AuditStatus.COMPLETED
         if not isinstance(status, AuditStatus):
             try:
@@ -217,6 +253,11 @@ class AuditRunner:
                 report.metadata["summary_artifact"] = ref.model_dump(mode="json")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("artifact put skipped: %s", exc)
+
+        if resumed:
+            events = events + [
+                {"kind": "task.resumed", "message": "continued from checkpoint"}
+            ]
 
         rec = await self.store.save_result(
             aid,
@@ -273,11 +314,41 @@ class AuditRunner:
                 record=row,
             )
 
-        # Try live checkpointer state
-        app = self._graph()
-        cfg = {"configurable": {"thread_id": audit_id}}
+        # Continue from the checkpoint if one exists for this thread.
+        app = await self._aget_graph()
+        runtime = runtime or GraphRuntime(offline=True)
+        runtime.cancel_check = lambda: self.is_cancelled(audit_id)
+        cfg: dict[str, Any] = {
+            "configurable": {"thread_id": audit_id, "runtime": runtime},
+            "recursion_limit": _recursion_limit(
+                row.request.budget if row.request else None
+            ),
+        }
+
+        snap = None
         try:
             snap = await app.aget_state(cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("aget_state resume miss: %s", exc)
+
+        if snap is not None and snap.values:
+            # `next` names the nodes the graph would run now. Non-empty means
+            # the run stopped part-way and can genuinely be continued —
+            # ainvoke(None, cfg) picks up from the last checkpoint rather than
+            # starting over, which is what "resume" was supposed to mean.
+            pending_nodes = tuple(getattr(snap, "next", ()) or ())
+            if pending_nodes:
+                logger.info(
+                    "resuming %s mid-graph at %s", audit_id, ",".join(pending_nodes)
+                )
+                token = set_runtime(runtime)
+                try:
+                    result = await app.ainvoke(None, cfg)
+                finally:
+                    reset_runtime(token)
+                return await self._persist(audit_id, result, resumed=True)
+
+        try:
             if snap and snap.values and snap.values.get("status") is AuditStatus.COMPLETED:
                 result = snap.values
                 findings = list(result.get("normalized_findings") or [])
