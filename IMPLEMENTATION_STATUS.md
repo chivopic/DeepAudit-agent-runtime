@@ -47,7 +47,48 @@ uv run pytest \
 # 2026-07-24 node tools/tracer/budget wiring: **129 passed**
 # 2026-07-24 graph-audits JWT auth: **131 passed** (agent suite)
 # 2026-09-11 re-verified unchanged: **131 passed**
+# 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
+
+## Real LLM wiring for the graph path (2026-09-11)
+
+The LangGraph path was hard-wired to `FakeLLM`, so it could run a graph but
+could not actually audit anything. It now reaches the production LLM gateway —
+**behind a default-off flag**.
+
+| Change | Detail |
+|--------|--------|
+| `graph/llm_gateway.py` | New `LLMServiceGateway` implements the `LLMGateway` protocol over `app.services.llm.LLMService`. Credentials are never held here: `LLMService` resolves them per user from stored config, as the ReAct path does. |
+| `GRAPH_AUDITS_USE_REAL_LLM` | New setting, **default `False`**. `_resolve_llm()` returns `FakeLLM` (offline) unless explicitly enabled, so this surface still cannot reach paid APIs by default. |
+| Tolerant findings parsing | `analyze_file` only parsed findings when the reply started with `[`. Real models fence JSON in ```` ```json ````, so **every LLM finding was being silently dropped**. Now goes through the shared `AgentJsonParser.parse_any` (fence stripping + json-repair); also unwraps `{findings: [...]}`. |
+| CI | `tests/test_agent_llm_gateway.py` (18 tests) added to the gate. |
+
+### Verified against a real model (out of band, not a committed test)
+
+DeepSeek `deepseek-chat`, small Python fixture with three planted flaws:
+
+```text
+STATUS: completed | tokens_used: 1329
+FINDINGS: 6
+  llm       | critical | SQL Injection via string-formatted query    | line 6
+  llm       | critical | OS Command Injection in ping()              | line 10
+  llm       | critical | Insecure Deserialization with pickle.loads  | line 13
+  heuristic | high     | OS Command Injection                        | line 10
+  heuristic | high     | Insecure Deserialization                    | line 13
+  heuristic | medium   | Possible SQL string                         | line 6
+```
+
+Token accounting flows into `RunBudget`, and Phase 1 invariant 1 holds
+(`verification_status=not_run` on every finding).
+
+**Still open after this change:**
+
+- `GRAPH_AUDITS_FIXTURE_ONLY` remains `True`, so the *route* still accepts only
+  inline fixtures. Real-repository auditing over HTTP needs that trust boundary
+  reopened deliberately — untouched here.
+- Findings are not de-duplicated: the LLM and the heuristic tool report the same
+  flaw twice (6 findings for 3 flaws above).
+- Frontend still does not call `/api/v1/graph-audits/*`. Production remains ReAct.
 
 ## Legacy suite repair (2026-09-11)
 
@@ -58,6 +99,7 @@ were latent, not regressions. Now fixed:
 ```bash
 cd backend && uv run pytest -q
 # 2026-09-11: **1082 passed, 8 skipped, 0 failed**
+# 2026-09-11 after real-LLM wiring: **1100 passed, 8 skipped, 0 failed**
 ```
 
 | Fix | Detail |

@@ -37,6 +37,26 @@ from app.services.agent.graph.runtime import GraphRuntime
 router = APIRouter()
 
 
+async def _resolve_llm(db: AsyncSession, user: User):
+    """Pick the graph LLM gateway.
+
+    Default is FakeLLM: this experimental surface must not reach paid APIs
+    unless GRAPH_AUDITS_USE_REAL_LLM is explicitly enabled. When it is, the
+    real gateway is built from the caller's own stored config, exactly as the
+    production ReAct path does — no credentials live in this module.
+    """
+    if not bool(getattr(settings, "GRAPH_AUDITS_USE_REAL_LLM", False)):
+        return FakeLLM(), True
+
+    # Imported lazily so the offline default path never pulls the LLM stack.
+    from app.api.v1.endpoints.agent_tasks import _get_user_config
+    from app.services.agent.graph.llm_gateway import LLMServiceGateway
+    from app.services.llm.service import LLMService
+
+    user_config = await _get_user_config(db, str(user.id))
+    return LLMServiceGateway(LLMService(user_config=user_config)), False
+
+
 class GraphAuditStartRequest(BaseModel):
     """Minimal start body for offline / fixture-driven graph audits."""
 
@@ -226,11 +246,12 @@ async def start_graph_audit(
         ),
         enable_verification=False,
     )
-    # Dual-path experimental route: FakeLLM only until ModelRouter is wired to
-    # the production LLM gateway. Never hit paid APIs from this surface.
+    # Dual-path experimental route. FakeLLM by default; the real gateway only
+    # when GRAPH_AUDITS_USE_REAL_LLM is set (see _resolve_llm).
+    llm, offline = await _resolve_llm(db, current_user)
     runtime = GraphRuntime(
-        llm=FakeLLM(),
-        offline=True,
+        llm=llm,
+        offline=offline,
         extra={"fixture_files": fixture_files},
     )
 

@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     GRAPH_AUDITS_MAX_FIXTURE_BYTES: int = 2_000_000
     # When False (default), start returns immediately and run continues in background.
     GRAPH_AUDITS_SYNC_START: bool = False
+    # When True, the graph path calls the real LLM gateway instead of FakeLLM.
+    # Default False: this surface must not reach paid APIs unless opted in.
+    GRAPH_AUDITS_USE_REAL_LLM: bool = False
     # When True, require project_id to exist and current user is owner/member (needs DB).
     # Default False so offline fixture dual-path tests work without Postgres projects.
     GRAPH_AUDITS_ENFORCE_PROJECT_ACL: bool = False

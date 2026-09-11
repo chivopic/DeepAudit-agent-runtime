@@ -111,6 +111,31 @@ def _node_span(runtime: GraphRuntime, node_name: str, **attrs: Any):
         return nullcontext()
 
 
+def _parse_llm_findings(content: Optional[str]) -> list[dict[str, Any]]:
+    """Extract a findings list from a model reply.
+
+    Real models fence their JSON or prefix it with prose, so delegate to the
+    shared tolerant parser (markdown stripping + json-repair) instead of
+    requiring a bare leading "[". Accepts either a top-level array or an
+    object wrapping one under a conventional key.
+    """
+    text = (content or "").strip()
+    if not text:
+        return []
+
+    from app.services.agent.json_parser import AgentJsonParser
+
+    parsed = AgentJsonParser.parse_any(text, default=None)
+    if isinstance(parsed, dict):
+        for key in ("findings", "results", "issues", "vulnerabilities"):
+            if isinstance(parsed.get(key), list):
+                parsed = parsed[key]
+                break
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
 def _lang_for(path: str) -> Optional[str]:
     ext = Path(path).suffix.lower()
     return {
@@ -736,46 +761,42 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
             usage = usage.add(resp.usage)
             tokens = resp.usage.total_tokens or 0
             budget = budget.consume_model_call(tokens=tokens)
-            # Parse optional structured findings from FakeLLM
-            text = (resp.content or "").strip()
-            if text.startswith("["):
+            # Parse optional structured findings. Real models wrap JSON in
+            # markdown fences or a prose preamble, so go through the shared
+            # tolerant parser rather than requiring a bare leading "[".
+            for item in _parse_llm_findings(resp.content):
+                line = int(item.get("line") or 1)
+                loc = SourceLocation(
+                    file_path=task.target_path,
+                    start_line=line,
+                    end_line=line,
+                )
+                sev_raw = str(item.get("severity") or "medium").lower()
                 try:
-                    arr = json.loads(text)
-                    for item in arr:
-                        line = int(item.get("line") or 1)
-                        loc = SourceLocation(
-                            file_path=task.target_path,
-                            start_line=line,
-                            end_line=line,
-                        )
-                        sev_raw = str(item.get("severity") or "medium").lower()
-                        try:
-                            sev = Severity(sev_raw)
-                        except ValueError:
-                            sev = Severity.MEDIUM
-                        candidates.append(
-                            CandidateFinding(
-                                title=str(item.get("title") or "LLM finding"),
-                                description=str(
-                                    item.get("description") or item.get("title") or ""
-                                ),
-                                severity=sev,
+                    sev = Severity(sev_raw)
+                except ValueError:
+                    sev = Severity.MEDIUM
+                candidates.append(
+                    CandidateFinding(
+                        title=str(item.get("title") or "LLM finding"),
+                        description=str(
+                            item.get("description") or item.get("title") or ""
+                        ),
+                        severity=sev,
+                        location=loc,
+                        evidence=[
+                            Evidence(
+                                kind="model",
+                                summary="llm candidate",
                                 location=loc,
-                                evidence=[
-                                    Evidence(
-                                        kind="model",
-                                        summary="llm candidate",
-                                        location=loc,
-                                        confidence=0.55,
-                                    )
-                                ],
                                 confidence=0.55,
-                                analyzer="llm",
-                                source_task_id=task.id,
                             )
-                        )
-                except json.JSONDecodeError:
-                    pass
+                        ],
+                        confidence=0.55,
+                        analyzer="llm",
+                        source_task_id=task.id,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("analyze_file llm failed: %s", exc)
 
