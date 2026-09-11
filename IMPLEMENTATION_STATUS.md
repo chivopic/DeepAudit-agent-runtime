@@ -50,6 +50,61 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Verification: M7 was unreachable, and measuring it exposed a scoring bug (2026-09-11)
+
+### The subgraph was never called
+
+M7 shipped a verification subgraph with six tests and was marked **Done**. It
+was imported by exactly one file: its own test. `enable_verification` was a
+field no code read, and the route hardcoded it to `False`, so every finding
+came back `NOT_RUN` no matter what the request asked for.
+
+Same shape as the `FakeLLM` wiring and `severity_threshold`: built, tested,
+never connected.
+
+It now runs as a node between `prioritize_findings` and `generate_report`, and
+the behaviour ladder is enforced rather than assumed:
+
+| Request | Runtime | Status |
+|---------|---------|--------|
+| `enable_verification=False` | any | `not_run` — Phase 1 invariant 1 preserved |
+| `enable_verification=True` | offline | `skipped` — ADR-003: no untrusted execution on the default path |
+| `enable_verification=True` | online | execution attempted |
+
+A failing verifier costs the verification, not the audit.
+
+### Measuring it caught a bug in the benchmark, not the engine
+
+The first `--verify` run reported ReAct as `not_run=14  (nothing verified)`.
+That was **a measurement artifact**. ReAct has no `verification_status` field
+at all — it uses `is_verified` / `needs_verification` / `verdict` — and the
+scorer defaulted a missing key to `not_run`, which reads as "this engine never
+verifies". The scorer now normalises both vocabularies and says `unreported`
+when neither is present.
+
+Worth recording as a method note: a benchmark that assumes one engine's
+vocabulary will quietly score the other engine wrong.
+
+### With that fixed, verification is the sharpest difference between them
+
+```text
+graph   recall 16/17  findings 22  FP 0  unmatched 6   verification: inconclusive=22
+react   recall  6/17  findings  6  FP 0  unmatched 0   verification: confirmed=6
+```
+
+**ReAct's sandbox verification works as a filter.** It cut its own output to
+six findings and confirmed every one — nothing spurious, nothing unmatched.
+The graph path runs verification but confirms nothing: its executor cannot
+actually exploit anything, so everything lands `inconclusive`.
+
+For a security product, "six confirmed exploitable issues" is a different
+product from "twenty-two things that might be issues". This is the strongest
+argument yet that the two paths are complementary rather than competing.
+
+**Caveat:** the corpus is snippets, so both numbers are floors — a function
+with no entrypoint cannot be exploited by either engine. ReAct confirming six
+of them at all is the notable part.
+
 ## Cross-file context: the graph path now reads the guards it relies on (2026-09-11)
 
 The benchmark had established that the graph path does not reason across

@@ -53,6 +53,7 @@ jobs:
             tests/test_benchmark_scorer.py \
             tests/test_agent_finding_quality.py \
             tests/test_agent_cross_file_context.py \
+            tests/test_agent_verification_wiring.py \
             -q --tb=short
 
       - name: Run eval CI suite

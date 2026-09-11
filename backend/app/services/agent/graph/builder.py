@@ -20,7 +20,7 @@ def build_audit_graph() -> StateGraph:
         START → validate_request → ingest_repository → build_manifest
               → plan_audit → analyze_file* → aggregate_findings
               → deduplicate_findings → prioritize_findings
-              → generate_report → END
+              → verify_findings → generate_report → END
     """
     g: StateGraph = StateGraph(AuditState)
 
@@ -32,6 +32,7 @@ def build_audit_graph() -> StateGraph:
     g.add_node("aggregate_findings", nodes.aggregate_findings)
     g.add_node("deduplicate_findings", nodes.deduplicate_findings)
     g.add_node("prioritize_findings", nodes.prioritize_findings)
+    g.add_node("verify_findings", nodes.verify_findings_node)
     g.add_node("generate_report", nodes.generate_report)
     g.add_node("finalize_cancelled", nodes.finalize_cancelled)
 
@@ -65,7 +66,10 @@ def build_audit_graph() -> StateGraph:
     )
     g.add_edge("aggregate_findings", "deduplicate_findings")
     g.add_edge("deduplicate_findings", "prioritize_findings")
-    g.add_edge("prioritize_findings", "generate_report")
+    # M7 subgraph runs here when the request enables it; the node itself
+    # is a no-op otherwise, so the default path is unchanged.
+    g.add_edge("prioritize_findings", "verify_findings")
+    g.add_edge("verify_findings", "generate_report")
     g.add_edge("generate_report", END)
     g.add_edge("finalize_cancelled", END)
 
