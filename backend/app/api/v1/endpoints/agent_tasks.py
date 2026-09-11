@@ -2420,7 +2420,11 @@ async def _get_project_root(
         if is_task_cancelled(task_id):
             raise asyncio.CancelledError("任务已取消")
 
-    base_path = f"/tmp/deepaudit/{task_id}"
+    # Must sit under SANDBOX_WORKSPACE_ROOT: the sandbox worker asks the host
+    # daemon to mount this path, so it has to be a real host path shared with
+    # the worker, not a path private to this container (ADR-003 #6).
+    workspace_root = getattr(settings, "SANDBOX_WORKSPACE_ROOT", "/tmp/deepaudit")
+    base_path = os.path.join(workspace_root, task_id)
 
     # 确保目录存在且为空
     if os.path.exists(base_path):

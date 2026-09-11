@@ -55,11 +55,26 @@ class SandboxManager:
         self._docker_client = None
         self._initialized = False
         self._init_error = None
+        # ADR-003 #6: when a sandbox worker is configured the API must not open
+        # docker.sock at all — the work is sent to the worker instead.
+        from app.services.agent.tools.sandbox_backend import build_backend
+
+        self._backend = build_backend()
     
     async def initialize(self):
         """初始化 Docker 客户端"""
         if self._initialized:
             logger.info("✅ SandboxManager already initialized")
+            return
+
+        if self._backend is not None:
+            available, error = await self._backend.probe()
+            self._initialized = available
+            self._init_error = None if available else error
+            if available:
+                logger.info("✅ Sandbox worker reachable (%s)", self._backend.name)
+            else:
+                logger.warning("❌ Sandbox worker unavailable: %s", error)
             return
 
         try:
@@ -84,14 +99,20 @@ class SandboxManager:
     
     @property
     def is_available(self) -> bool:
-        """检查 Docker 是否可用"""
+        """沙箱是否可用（远端 worker 或本地 Docker）"""
+        if self._backend is not None:
+            return self._initialized
         return self._docker_client is not None
         
     def get_diagnosis(self) -> str:
         """获取诊断信息"""
+        where = "sandbox worker" if self._backend is not None else "local Docker"
         if self.is_available:
-            return "Docker Service Available"
-        return f"Docker Service Unavailable. Error: {self._init_error or 'Not initialized'}"
+            return f"Sandbox Available ({where})"
+        return (
+            f"Sandbox Unavailable ({where}). "
+            f"Error: {self._init_error or 'Not initialized'}"
+        )
     
     async def execute_command(
         self,
@@ -122,6 +143,15 @@ class SandboxManager:
             }
         
         timeout = timeout or self.config.timeout
+
+        if self._backend is not None:
+            # The worker builds the container; this process never sees docker.
+            return await self._backend.execute(
+                command,
+                working_dir=working_dir,
+                env=env,
+                timeout=timeout,
+            )
 
         # 禁用代理环境变量，防止 Docker 自动注入的代理干扰容器网络
         no_proxy_env = {
@@ -250,6 +280,16 @@ class SandboxManager:
             }
         
         timeout = timeout or self.config.timeout
+
+        if self._backend is not None:
+            # The workdir is jailed to the workspace root worker-side.
+            return await self._backend.execute_tool(
+                command,
+                host_workdir=host_workdir,
+                env=env,
+                timeout=timeout,
+                network_mode=network_mode,
+            )
 
         # 禁用代理环境变量，防止 Docker 自动注入的代理干扰容器网络
         no_proxy_env = {

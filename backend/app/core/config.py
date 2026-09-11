@@ -142,6 +142,20 @@ class Settings(BaseSettings):
     SANDBOX_NETWORK_MODE: str = "none"  # 沙箱网络模式 (none, bridge)
     SANDBOX_CAP_DROP: str = "SYS_ADMIN,NET_ADMIN,SYS_PTRACE,SYS_RAWIO,SYS_MODULE,SYS_BOOT,MKNOD,AUDIT_WRITE,AUDIT_CONTROL,SETFCAP,MAC_OVERRIDE,MAC_ADMIN"  # 丢弃的 Linux 能力，逗号分隔，设置 ALL 丢弃全部
     SANDBOX_NO_NEW_PRIVILEGES: bool = True  # 禁止提权，某些环境可能需要关闭
+    SANDBOX_USER: str = "1000:1000"  # 沙箱容器运行用户
+
+    # ---- Sandbox worker (ADR-003 #6) ----
+    # When set, the API sends sandbox work to this URL instead of opening
+    # docker.sock itself. The worker owns the socket; the API must not.
+    SANDBOX_WORKER_URL: Optional[str] = None
+    # Shared secret for the worker. The worker refuses to execute without one.
+    SANDBOX_WORKER_TOKEN: Optional[str] = None
+    SANDBOX_WORKER_TIMEOUT: int = 660  # HTTP timeout, above SANDBOX_TIMEOUT
+    # Host directory the worker may mount into containers. Requested workdirs
+    # are resolved (symlinks included) and must stay inside it.
+    SANDBOX_WORKSPACE_ROOT: str = "/tmp/deepaudit"
+    # Container network stays off unless explicitly enabled (ADR-003 #8).
+    SANDBOX_ALLOW_NETWORK: bool = False
     
     # RAG 配置
     RAG_CHUNK_SIZE: int = 1500  # 代码块大小（Token）

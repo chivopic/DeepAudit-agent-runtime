@@ -22,16 +22,17 @@ async def check_agent_services():
     """检查 Agent 必须服务的可用性"""
     issues = []
 
-    # 检查 Docker/沙箱服务
-    try:
-        import docker
-        client = docker.from_env()
-        client.ping()
-        logger.info("  - Docker 服务可用")
-    except ImportError:
-        issues.append("Docker Python 库未安装 (pip install docker)")
-    except Exception as e:
-        issues.append(f"Docker 服务不可用: {e}")
+    # 检查沙箱可用性。
+    # ADR-003 #6: 配置了 sandbox worker 时，API 进程不应该持有 docker.sock，
+    # 因此这里探测 worker，而不是本地 Docker 守护进程。
+    from app.services.agent.tools.sandbox_tool import SandboxManager
+
+    manager = SandboxManager()
+    await manager.initialize()
+    if manager.is_available:
+        logger.info("  - %s", manager.get_diagnosis())
+    else:
+        issues.append(manager.get_diagnosis())
 
     # 检查 Redis 连接（可选警告）
     try:

@@ -40,7 +40,9 @@ services:
     restart: unless-stopped
     volumes:
       - backend_uploads:/app/uploads
-      - /var/run/docker.sock:/var/run/docker.sock
+      # docker.sock deliberately NOT mounted here (ADR-003 #6) —
+      # sandbox work goes to the sandbox-worker service.
+      - /var/lib/deepaudit/workspace:/var/lib/deepaudit/workspace
     ports:
       - "8000:8000"
     environment:
@@ -48,6 +50,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
       - SANDBOX_ENABLED=true
+      - SANDBOX_WORKER_URL=http://sandbox-worker:8900
+      - SANDBOX_WORKER_TOKEN=${SANDBOX_WORKER_TOKEN:?set SANDBOX_WORKER_TOKEN in your .env}
+      - SANDBOX_WORKSPACE_ROOT=/var/lib/deepaudit/workspace
       - SANDBOX_IMAGE=ghcr.io/lintsinghua/deepaudit-sandbox:latest
       # LLM 配置 - 请根据需要修改
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
@@ -108,6 +113,30 @@ services:
     image: ghcr.io/lintsinghua/deepaudit-sandbox:latest
     restart: "no"
     command: echo "Sandbox image ready"
+
+  # Owns docker.sock so the API does not have to (ADR-003 #6). Internal network
+  # only, no published ports: a compromised API can spend sandbox capacity but
+  # cannot reach the host daemon.
+  sandbox-worker:
+    image: ghcr.io/lintsinghua/deepaudit-backend:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same path on host and in the container: the host daemon resolves the
+      # workspace path the worker asks it to mount.
+      - /var/lib/deepaudit/workspace:/var/lib/deepaudit/workspace
+    environment:
+      - SANDBOX_WORKER_TOKEN=${SANDBOX_WORKER_TOKEN:?set SANDBOX_WORKER_TOKEN in your .env}
+      - SANDBOX_WORKSPACE_ROOT=/var/lib/deepaudit/workspace
+      - SANDBOX_IMAGE=ghcr.io/lintsinghua/deepaudit-sandbox:latest
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - NO_PROXY=*
+    command: .venv/bin/uvicorn app.sandbox_worker.main:app --host 0.0.0.0 --port 8900
+    networks:
+      - deepaudit-network
 
 networks:
   deepaudit-network:
