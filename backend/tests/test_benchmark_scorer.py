@@ -177,3 +177,55 @@ def test_every_cross_file_helper_location_is_a_real_line():
         for path, line in lab.also_at:
             lines = (root / path).read_text(encoding="utf-8").splitlines()
             assert 1 <= line <= len(lines), f"{path}:{line} out of range"
+
+
+# ---------------------------------------------------------------------------
+# Verification vocabularies
+# ---------------------------------------------------------------------------
+
+
+def test_the_graph_vocabulary_is_read():
+    from tests.evals.benchmark.scorer import _verification_status_of
+
+    assert _verification_status_of({"verification_status": "CONFIRMED"}) == "confirmed"
+
+
+@pytest.mark.parametrize(
+    "finding,expected",
+    [
+        ({"is_verified": True, "needs_verification": False}, "confirmed"),
+        ({"is_verified": False, "needs_verification": True}, "needs_verification"),
+        ({"is_verified": False, "needs_verification": False}, "unverified"),
+        ({"verdict": "Exploitable"}, "verdict:exploitable"),
+    ],
+)
+def test_the_react_vocabulary_is_read(finding, expected):
+    """ReAct has no verification_status field at all."""
+    from tests.evals.benchmark.scorer import _verification_status_of
+
+    assert _verification_status_of(finding) == expected
+
+
+def test_a_finding_with_neither_vocabulary_is_unreported_not_not_run():
+    """Defaulting a missing key to "not_run" reported ReAct as never verifying
+    — a measurement artifact, not a fact about the engine."""
+    from tests.evals.benchmark.scorer import _verification_status_of
+
+    assert _verification_status_of({"title": "x"}) == "unreported"
+
+
+def test_verification_counts_are_collected():
+    findings = [
+        _f("a.py", 1, verification_status="inconclusive"),
+        _f("a.py", 2, verification_status="inconclusive"),
+        _f("a.py", 3, is_verified=True),
+    ]
+    s = score("x", findings, CORPUS.vulnerable, CORPUS.safe_paths)
+    assert s.verification == {"inconclusive": 2, "confirmed": 1}
+    assert "inconclusive=2" in s.verification_row()
+
+
+def test_an_all_not_run_engine_is_called_out():
+    findings = [_f("a.py", 1, verification_status="not_run")]
+    s = score("x", findings, CORPUS.vulnerable, CORPUS.safe_paths)
+    assert "nothing verified" in s.verification_row()

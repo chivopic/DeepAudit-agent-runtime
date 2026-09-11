@@ -92,7 +92,7 @@ def _llm_service():
 # ---------------------------------------------------------------------------
 
 
-async def run_graph(root: str) -> EngineScore:
+async def run_graph(root: str, *, verify: bool = False) -> EngineScore:
     from app.services.agent.application.facade import GraphAuditFacade
     from app.services.agent.domain import AuditRequest, RunBudget
     from app.services.agent.domain.repository import RepositoryRef
@@ -103,6 +103,7 @@ async def run_graph(root: str) -> EngineScore:
         repository=RepositoryRef(source_type="local", local_path=root),
         languages=["python", "javascript"],
         budget=RunBudget(max_tokens=400_000, max_model_calls=80),
+        enable_verification=verify,
     )
     runtime = GraphRuntime(llm=LLMServiceGateway(_llm_service()), offline=False)
     facade = GraphAuditFacade()
@@ -134,7 +135,7 @@ async def run_graph(root: str) -> EngineScore:
 # ---------------------------------------------------------------------------
 
 
-async def run_react(root: str) -> EngineScore:
+async def run_react(root: str, *, verify: bool = False) -> EngineScore:
     blocking, advisory = await react_preconditions()
 
     from app.api.v1.endpoints.agent_tasks import (
@@ -166,9 +167,7 @@ async def run_react(root: str) -> EngineScore:
                 "project_info": project_info,
                 "config": {
                     "target_vulnerabilities": [],
-                    # analysis_only: the benchmark compares detection, and
-                    # sandbox verification needs a worker + images.
-                    "verification_level": "analysis_only",
+                    "verification_level": "sandbox" if verify else "analysis_only",
                     "exclude_patterns": [],
                     "target_files": [],
                     "max_iterations": 30,
@@ -234,6 +233,14 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engines", default="graph,react")
     parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="ask each engine to verify its findings: enable_verification for "
+             "the graph path, verification_level=sandbox for ReAct. Note that "
+             "confirming an exploit needs a runnable target — a corpus of "
+             "snippets can show that verification ran, not that it is accurate",
+    )
+    parser.add_argument(
         "--show-xfile",
         action="store_true",
         help="print the finding text matched to each cross-file label, to check "
@@ -267,7 +274,7 @@ async def main() -> int:
         for i in range(max(1, args.repeat)):
             label = f"{name} ({i + 1}/{args.repeat})" if args.repeat > 1 else name
             print(f"running {label} ...")
-            r = await runner(root)
+            r = await runner(root, verify=args.verify)
             spreads.setdefault(name, []).append(r.labels_found)
             if args.show_xfile:
                 _print_xfile_hits(name, r)
@@ -276,6 +283,8 @@ async def main() -> int:
     print("\n" + "=" * 100)
     for r in results:
         print(r.row())
+        if args.verify:
+            print(f"    verification: {r.verification_row()}")
         if r.degraded:
             print("    ⚠ DEGRADED — not a valid comparison, this engine ran without:")
             for d in r.degraded:

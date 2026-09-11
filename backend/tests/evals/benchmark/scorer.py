@@ -35,6 +35,34 @@ _KIND_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _verification_status_of(finding: dict[str, Any]) -> str:
+    """Normalise the two vocabularies the engines use.
+
+    The graph path emits ``verification_status`` (a VerificationStatus value).
+    ReAct emits ``is_verified`` / ``needs_verification`` / ``verdict`` and has
+    no such field at all — so defaulting a missing key to "not_run" silently
+    reports ReAct as never verifying, which is a measurement artifact rather
+    than a fact about the engine. Read both, and say "unreported" when neither
+    vocabulary is present.
+    """
+    explicit = finding.get("verification_status") or finding.get("verification")
+    if explicit:
+        return str(explicit).lower()
+
+    if "is_verified" in finding or "needs_verification" in finding:
+        if finding.get("is_verified"):
+            return "confirmed"
+        if finding.get("needs_verification"):
+            return "needs_verification"
+        return "unverified"
+
+    verdict = finding.get("verdict")
+    if verdict:
+        return f"verdict:{str(verdict).lower()}"
+
+    return "unreported"
+
+
 def _norm_path(p: Optional[str]) -> str:
     return (p or "").replace("\\", "/").strip().lstrip("./").lower()
 
@@ -117,6 +145,10 @@ class EngineScore:
     # it scored. A hit that would also fire on the safe counterpart is not
     # comprehension, and only the text shows the difference.
     raw_findings: list[dict[str, Any]] = field(default_factory=list)
+    # verification_status counts. The graph path reported NOT_RUN for every
+    # finding until the M7 subgraph was actually wired in; this makes that
+    # visible instead of leaving it an assumption.
+    verification: dict[str, int] = field(default_factory=dict)
     # Capabilities this engine was missing at run time. Non-empty means the
     # numbers describe a crippled engine and must not be read as a verdict.
     degraded: list[str] = field(default_factory=list)
@@ -149,6 +181,19 @@ class EngineScore:
             f"tokens {self.tokens:>7}  "
             f"{self.seconds:6.1f}s"
         )
+
+    def verification_row(self) -> str:
+        """One line of verification_status counts, or a plain statement that
+        nothing was verified — which is itself the finding for a path that
+        never ran the subgraph."""
+        if not self.verification:
+            return "no findings"
+        parts = ", ".join(
+            f"{k}={v}" for k, v in sorted(self.verification.items())
+        )
+        only_not_run = set(self.verification) <= {"not_run", "none", ""}
+        suffix = "  (nothing verified)" if only_not_run else ""
+        return parts + suffix
 
 
 def score(
@@ -187,6 +232,10 @@ def score(
             if label.cross_file:
                 result.xfile_found += 1
             matched_findings.add(hit)
+
+    for f in findings:
+        status = _verification_status_of(f)
+        result.verification[status] = result.verification.get(status, 0) + 1
 
     for i, f in enumerate(findings):
         fpath = _norm_path(f.get("file_path") or f.get("path"))

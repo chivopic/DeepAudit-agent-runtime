@@ -1299,6 +1299,75 @@ async def prioritize_findings(state: AuditState, config: Optional[RunnableConfig
     }
 
 
+async def verify_findings_node(
+    state: AuditState, config: Optional[RunnableConfig] = None
+) -> dict:
+    """Run the M7 verification subgraph over the prioritised findings.
+
+    Gated on ``AuditRequest.enable_verification``, which until now was a field
+    nobody read: the subgraph existed and was tested, but nothing in the audit
+    graph ever called it, so every finding stayed NOT_RUN regardless.
+
+    Execution stays off unless the request asks for it *and* the runtime is not
+    offline — Phase 1's invariant is that the default path runs no untrusted
+    code (ADR-003), and that is enforced here rather than assumed.
+    """
+    runtime = get_runtime(config)
+    findings = list(state.get("normalized_findings") or [])
+    req = state.get("request")
+
+    if not findings or req is None or not req.enable_verification:
+        return {
+            "events": [
+                _event(
+                    "node.completed",
+                    "verify_findings skipped",
+                    reason="disabled" if req is not None else "no request",
+                    count=len(findings),
+                )
+            ]
+        }
+
+    allow_execution = bool(req.enable_verification) and not runtime.offline
+
+    with _node_span(runtime, "verify_findings", count=len(findings)):
+        try:
+            from app.services.agent.graph.subgraphs import verify_findings
+
+            verified = await verify_findings(
+                findings,
+                allow_execution=allow_execution,
+                sandbox=runtime.extra.get("sandbox"),
+            )
+        except Exception as exc:  # noqa: BLE001 — verification must not sink a run
+            logger.warning("verification failed: %s", exc)
+            return {
+                "events": [_event("node.failed", f"verify_findings: {exc}"[:200])]
+            }
+
+    # VerifiedFinding subclasses Finding, so these are the findings — enriched,
+    # not wrapped.
+    updated: list[Finding] = [vf for vf in verified if isinstance(vf, Finding)]
+
+    counts: dict[str, int] = {}
+    for f in updated:
+        key = getattr(f.verification_status, "value", str(f.verification_status))
+        counts[key] = counts.get(key, 0) + 1
+
+    return {
+        "normalized_findings": updated or findings,
+        "events": [
+            _event(
+                "node.completed",
+                "verify_findings",
+                count=len(updated),
+                allow_execution=allow_execution,
+                **counts,
+            )
+        ],
+    }
+
+
 async def generate_report(state: AuditState, config: Optional[RunnableConfig] = None) -> dict:
     """Build AuditReport with explicit Phase-1 NOT_RUN verification note."""
     runtime = get_runtime(config)
