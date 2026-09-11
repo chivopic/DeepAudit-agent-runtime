@@ -123,6 +123,10 @@ class Settings(BaseSettings):
     # always derived server-side from the stored Project record (never from the
     # client) and the project ACL check is mandatory on that route.
     GRAPH_AUDITS_ALLOW_PROJECT_SOURCE: bool = True
+    # Ceiling for the LangGraph recursion limit derived from a run's budget.
+    # Each analyzed file is a super-step, so the LangGraph default of 25 caps an
+    # audit at roughly twenty files.
+    GRAPH_AUDITS_RECURSION_LIMIT_CAP: int = 2000
     # When True, the graph path calls the real LLM gateway instead of FakeLLM.
     # Default False: this surface must not reach paid APIs unless opted in.
     GRAPH_AUDITS_USE_REAL_LLM: bool = False

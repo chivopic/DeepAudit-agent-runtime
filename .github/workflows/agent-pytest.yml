@@ -48,6 +48,7 @@ jobs:
             tests/test_agent_llm_gateway.py \
             tests/test_agent_dedupe.py \
             tests/test_agent_project_source.py \
+            tests/test_agent_realrepo_regressions.py \
             -q --tb=short
 
       - name: Run eval CI suite

@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.services.agent.domain import (
     AuditRequest,
     AuditStatus,
@@ -29,6 +30,29 @@ from app.services.agent.persistence.checkpointer import create_checkpointer
 logger = logging.getLogger(__name__)
 
 
+# Nodes outside the per-file loop (validate, ingest, manifest, plan, aggregate,
+# dedupe, prioritize, report) plus routing headroom.
+_GRAPH_FIXED_STEPS = 12
+
+
+def _recursion_limit(budget: Any) -> int:
+    """Derive LangGraph's recursion limit from the run budget.
+
+    Every ``analyze_file`` iteration is a super-step, so LangGraph's default of
+    25 caps an audit at roughly twenty files — a real repository dies with
+    GraphRecursionError long before the budget is spent. Size the limit from
+    whichever budget cap actually bounds the loop.
+
+    Erring high is safe: the budget still stops the run. Erring low kills it.
+    """
+    max_files = int(getattr(budget, "max_files", 0) or 0)
+    max_model_calls = int(getattr(budget, "max_model_calls", 0) or 0)
+    per_file = max(max_files, max_model_calls)
+    limit = _GRAPH_FIXED_STEPS + 2 * per_file
+    cap = int(getattr(settings, "GRAPH_AUDITS_RECURSION_LIMIT_CAP", 2000))
+    return max(25, min(limit, cap))
+
+
 def _serialize_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     """JSON-friendly summary for resume metadata (not full LangGraph checkpoint)."""
     snap: dict[str, Any] = {
@@ -47,6 +71,11 @@ def _serialize_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     usage = result.get("usage")
     if usage is not None and hasattr(usage, "model_dump"):
         snap["usage"] = usage.model_dump()
+    # File count must survive into the snapshot: start is async by default, so
+    # clients read the persisted row, not the in-memory result.
+    manifest = result.get("manifest")
+    if manifest is not None and hasattr(manifest, "files"):
+        snap["total_files"] = len(manifest.files)
     return snap
 
 
@@ -129,7 +158,8 @@ class AuditRunner:
                     "configurable": {
                         "thread_id": aid,
                         "runtime": runtime,
-                    }
+                    },
+                    "recursion_limit": _recursion_limit(request.budget),
                 },
             )
         except Exception as exc:  # noqa: BLE001

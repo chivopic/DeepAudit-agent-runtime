@@ -50,6 +50,57 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Real-stack verification: two bugs fixtures could not catch (2026-09-11)
+
+`source_type="project"` shipped with unit tests only. Running it for real —
+Postgres, Alembic migrations, a seeded user and project, a JWT, a genuine clone
+of this repository over HTTP — found two bugs that no fixture test could reach.
+
+### K9 · GraphRecursionError on any repository over ~20 files
+
+`AuditRunner.run` never set LangGraph's `recursion_limit`, so it used the stock
+default of 25. Every `analyze_file` iteration is a super-step, so an audit died
+with `GraphRecursionError` once it passed roughly twenty files — the entire run
+failed, findings and all.
+
+Invisible until now because fixtures hold a handful of files and test budgets
+stop the loop first. The first real repository hit it immediately.
+
+The limit is now derived from whichever budget cap actually bounds the loop
+(`max_files` or `max_model_calls`), plus fixed overhead, floored at LangGraph's
+25 and capped by `GRAPH_AUDITS_RECURSION_LIMIT_CAP` (default 2000). Erring high
+is safe — the budget still stops the run; erring low kills it.
+
+### K10 · `total_files` always 0 on the polling path
+
+`GraphAuditFacade.get_task` initialised `total = 0` and never assigned it, while
+`_result_to_task_dict` derived the count from the manifest. Start is async (202)
+by default, so **every real client polls `get_task`** and saw `total_files: 0`
+and `indexed_files: 0` regardless of repository size.
+
+The file count is now persisted into `graph_snapshot` and read back on poll.
+
+### Verified
+
+Auditing this repository through the real HTTP surface:
+
+```text
+no-auth                -> 401
+no project_id          -> 400  project_id is required for source_type="project"
+host local_path "/etc" -> 400  client host local_path is rejected
+start                  -> 202
+
+FINAL STATUS: partial | files: 437 | findings: 79 | tokens: 31281
+```
+
+`partial` is correct here: the 25-model-call budget was exhausted. Findings are
+real model output persisted through the business store, e.g. *"Potential path
+traversal in zip extraction"* and *"First registered user is automatically
+granted superuser"*.
+
+Regression tests: `backend/tests/test_agent_realrepo_regressions.py` (8 tests,
+in the CI gate). Full backend suite: **1142 passed, 8 skipped, 0 failed**.
+
 ## Usable graph path: dedupe, real repositories, frontend API (2026-09-11)
 
 Follow-up to the LLM wiring below, closing the three gaps it left open.
@@ -305,6 +356,8 @@ harness/          # M11 AgentSpec + AgentRuntime
 | K4 | Cancel mid-flight is cooperative/in-process | Medium |
 | K5 | Memory checkpointer default | Medium (dev) |
 | K8 | CI gate added; fuller eval suite still local | Low |
+| K9 | ~~GraphRecursionError over ~20 files~~ | **Fixed** 2026-09-11 |
+| K10 | ~~total_files always 0 when polling~~ | **Fixed** 2026-09-11 |
 
 ## Post-M11 audit (2026-07-24)
 
