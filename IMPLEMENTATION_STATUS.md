@@ -50,6 +50,50 @@ uv run pytest \
 # 2026-09-11 + real-LLM wiring suite: **149 passed** (agent gate)
 ```
 
+## Cross-file context: the graph path now reads the guards it relies on (2026-09-11)
+
+The benchmark had established that the graph path does not reason across
+files — its "cross-file" hits were speculation, and tightening the prompt for
+exploitability made them disappear. The cause was simple: `analyze_file` sent
+one file's text and nothing else, so a guard defined elsewhere could not be
+judged. The call looked defended, and the model had to guess.
+
+It now resolves the **local** modules a file imports and includes their source.
+
+| Piece | Detail |
+|-------|--------|
+| `_local_imports` | Python relative and absolute, JS/TS `import` and `require`. Local only — `validators.py` is worth reading, `os` and `requests` are not. A file never imports itself. |
+| `_load_import_context` | Reads through the **same jail** as the file under analysis, so a crafted import string cannot become a path traversal. Works from fixtures as well as from disk. |
+| Budget | 3 modules, 1500 chars each. The point is to judge a guard, not to paste the repository into every prompt. |
+
+### The reasoning changed, not just the score
+
+Before, a cross-file hit read `Potential path traversal in attachment
+download` — a pattern, hedged. Now:
+
+```text
+Path traversal via incomplete '..' check in is_safe_path
+SSRF via incomplete host blocklist in link preview fetcher
+Autoescaping disabled by LEGACY_TEMPLATE_MODE, enabling SSTI
+```
+
+It names the helper, and says *why* the guard fails — an incomplete check, a
+deny-list where an allowlist was needed, a constant set in another file.
+
+### Measured, three runs
+
+| | before context | after context |
+|---|---|---|
+| cross-file | 1/3 | **3/3, 3/3, 2/3** |
+| recall | 16.3 / 17 mean | **16.7 / 17 mean** |
+| false positives on safe code | 0 | **0 — no new noise** |
+| tokens | ~11k | ~14k (**+30%, the honest cost**) |
+| wall time | ~52s | ~53s |
+
+The autoescape case is still the flaky one (2/3): it needs the model to connect
+a boolean constant to escaping behaviour, which is the longest inferential hop
+in the corpus.
+
 ## Finding quality: defences are not defects (2026-09-11)
 
 The benchmark's negative fixtures exposed what was actually wrong with the

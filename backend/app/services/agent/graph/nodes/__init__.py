@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -619,6 +619,101 @@ def _line_builds_a_string(line: str) -> bool:
     return bool(re.search(r"""f["']""", stripped)) and "{" in stripped
 
 
+# Cross-file context budget. Kept tight on purpose: the point is to let the
+# model judge a guard defined elsewhere, not to paste the repository into every
+# prompt. Blowing the budget would cost more than the capability is worth.
+MAX_CONTEXT_MODULES = 3
+MAX_CONTEXT_CHARS = 1500
+
+_PY_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+(?P<from>\.{0,2}[\w.]+)\s+import|import\s+(?P<plain>[\w.]+))",
+    re.MULTILINE,
+)
+_JS_IMPORT_RE = re.compile(
+    r"""(?:from\s+|require\(\s*)["'](?P<mod>\.{1,2}/[^"']+)["']""",
+)
+
+
+def _local_imports(path: str, content: str) -> list[str]:
+    """Candidate workspace-relative paths this file imports.
+
+    Only local modules: a guard living in ``validators.py`` is worth reading,
+    ``os`` and ``requests`` are not. Returns plain candidates — whether any of
+    them exists is decided by the caller, which holds the file map.
+    """
+    here = PurePosixPath(path.replace("\\", "/"))
+    pkg = here.parent
+    out: list[str] = []
+
+    if here.suffix in {".py", ".pyi"}:
+        for m in _PY_IMPORT_RE.finditer(content):
+            name = m.group("from") or m.group("plain") or ""
+            if not name:
+                continue
+            if name.startswith("."):
+                # Relative: one leading dot means this package, two means up.
+                dots = len(name) - len(name.lstrip("."))
+                base = pkg
+                for _ in range(dots - 1):
+                    base = base.parent
+                tail = name.lstrip(".").replace(".", "/")
+                out.append(str(base / tail) + ".py" if tail else "")
+            else:
+                # Absolute, but only interesting when it resolves in-tree.
+                out.append(name.replace(".", "/") + ".py")
+    elif here.suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        for m in _JS_IMPORT_RE.finditer(content):
+            rel = m.group("mod")
+            target = pkg
+            parts = [p for p in rel.split("/") if p not in ("",)]
+            for part in parts:
+                if part == ".":
+                    continue
+                if part == "..":
+                    target = target.parent
+                else:
+                    target = target / part
+            stem = str(target)
+            if PurePosixPath(stem).suffix:
+                out.append(stem)
+            else:
+                out.extend(f"{stem}{ext}" for ext in (here.suffix, ".js", ".ts"))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for c in out:
+        if c and c != path and c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+
+def _load_import_context(
+    path: str,
+    content: str,
+    *,
+    fixture_files: dict[str, str],
+    root: Optional[Path],
+) -> list[tuple[str, str]]:
+    """Source of the local modules ``path`` imports, within budget.
+
+    Reads through the same jail as the file under analysis — a crafted import
+    string must not become a path traversal.
+    """
+    loaded: list[tuple[str, str]] = []
+    for candidate in _local_imports(path, content):
+        if len(loaded) >= MAX_CONTEXT_MODULES:
+            break
+        text = ""
+        if candidate in fixture_files:
+            text = fixture_files[candidate]
+        elif root is not None:
+            text = _safe_read_under_root(root, candidate)
+        if text:
+            loaded.append((candidate, text[:MAX_CONTEXT_CHARS]))
+    return loaded
+
+
 def _heuristic_candidates(task: AuditTaskSpec, content: str) -> list[CandidateFinding]:
     """Deterministic pattern hits so Fake-LLM-less runs still produce findings."""
     patterns = [
@@ -783,6 +878,17 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
             if root:
                 content = _safe_read_under_root(Path(root), task.target_path)
 
+        # Local modules this file imports. Without them a guard defined
+        # elsewhere cannot be judged: the call looks defended, and the model
+        # has to guess whether the defence holds.
+        root_path = _resolve_workspace(state, runtime)
+        import_context = _load_import_context(
+            task.target_path,
+            content,
+            fixture_files=fixture_files,
+            root=Path(root_path) if root_path else None,
+        )
+
         candidates = _heuristic_candidates(task, content)
         usage = state.get("usage") or ModelUsage()
 
@@ -887,7 +993,14 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
                                 "or general observations as findings — if the "
                                 "code handles the risk correctly, say nothing "
                                 "about it. Return [] when there is nothing "
-                                "exploitable."
+                                "exploitable.\n"
+                                "imports[] carries the source of local modules "
+                                "this file imports. Use it to judge whether a "
+                                "guard, validator or policy the file relies on "
+                                "actually holds — an allowlist that is really a "
+                                "deny-list, or a check that misses a case, "
+                                "makes the call site exploitable. Report such "
+                                "findings against the call site."
                             ),
                         ),
                         LLMMessage(
@@ -896,6 +1009,10 @@ async def analyze_file(state: AuditState, config: Optional[RunnableConfig] = Non
                                 {
                                     "path": task.target_path,
                                     "content": content[:4000],
+                                    "imports": [
+                                        {"path": p, "content": c}
+                                        for p, c in import_context
+                                    ],
                                 }
                             ),
                         ),
