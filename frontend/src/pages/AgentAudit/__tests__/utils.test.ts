@@ -376,6 +376,11 @@ describe("isTaskComplete", () => {
 		expect(isTaskComplete("cancelled")).toBe(true);
 	});
 
+	it("returns true for partial and paused", () => {
+		expect(isTaskComplete("partial")).toBe(true);
+		expect(isTaskComplete("paused")).toBe(true);
+	});
+
 	it("returns false for running", () => {
 		expect(isTaskComplete("running")).toBe(false);
 	});

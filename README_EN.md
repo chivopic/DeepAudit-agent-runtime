@@ -19,7 +19,8 @@
 </p>
 
 > **About this repo**: experimental **Agent Runtime refactor (M0–M11)** based on upstream [lintsinghua/DeepAudit](https://github.com/lintsinghua/DeepAudit) v3.0.0.  
-> Production ReAct path stays compatible; LangGraph dual-path + protocolized runtime are additive. Previous READMEs: [`backup/`](backup/).
+> Production ReAct path stays compatible; LangGraph dual-path + protocolized runtime are additive. Previous READMEs: [`backup/`](backup/).  
+> New Agent audits default to LangGraph through `/api/v1/agent-tasks`. The create dialog can still select classic ReAct. Single-host resume is in place. Multi-host Postgres resume and a Docker verification worker are not. Scope: [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 </div>
 
@@ -90,7 +91,7 @@ This branch delivers the **Agent Runtime refactor (M0–M11)** while freezing th
 | Domain | **Pydantic** models for API, tools, sandbox I/O |
 | Persistence | Checkpoint ≠ business DB ≠ Artifact Store |
 | Security | Phase 1: no untrusted exec by default; `verification_status=NOT_RUN` |
-| Migration | Dual-path: production ReAct frozen; LangGraph additive |
+| Migration | Same entry, two engines: new tasks default to LangGraph; `engine=react` keeps classic ReAct |
 
 > Core idea: attack like a hacker, defend like an expert.
 
@@ -110,8 +111,10 @@ This branch delivers the **Agent Runtime refactor (M0–M11)** while freezing th
 ### Dual-path agent runtime (this repo)
 
 ```text
-Frontend  →  /api/v1/agent-tasks/*   (production ReAct, frozen)
-          →  /api/v1/graph-audits/*  (LangGraph dual-path, new)
+Frontend  →  /api/v1/agent-tasks/*
+             engine=graph   default LangGraph audit
+             engine=react   classic ReAct fallback
+          →  /api/v1/graph-audits/*  fixture FakeLLM only
 
 backend/app/services/agent/
   domain/ graph/ persistence/ application/
@@ -120,7 +123,22 @@ backend/app/services/agent/
 
 | Milestone | Topic | Status |
 |-----------|-------|--------|
-| M0–M11 | Architecture → Harness | **Complete** (2026-07-24) |
+| M0–M11 | Experimental runtime | Recorded complete (2026-07-24) |
+| R2–R5 | Product path on `/api/v1/agent-tasks` | Landed for one host (2026-10-02) |
+
+M0–M11 is the experimental runtime record. The create dialog now starts R2–R5. Checkpoint resume is a single-host file. M3 is not a Postgres checkpointer, and M7 is not a Docker worker.
+
+### What a user can run
+
+Create still posts to `/api/v1/agent-tasks`. LangGraph is the default; the same dialog can select classic ReAct. Create already starts the run. There is no `POST /{id}/start`. Paused or failed graph tasks continue with `POST /{id}/resume` from the local file checkpoint. Completed, partial, and cancelled resumes do not start again.
+
+The activity log is short Chinese sentences: list files, match common dangerous patterns, then one updating analysis-progress line. The progress denominator is the queued file count. Pattern hits are clues, not confirmed vulnerabilities. Model opinions are labeled separately. The closing sentence states how many files were read and how long it took. A task that already finished keeps the text it stored.
+
+A `partial` progress bar is 100 because the run has stopped. File coverage stays `analyzed / total`, for example 7/15. A paused task keeps the phase-weighted position.
+
+With no model key the task stays partial and runs pattern scan only. The verification checkbox is off by default, so findings stay unconfirmed. Turning it on runs in-process pattern confirmation and can mark a hit confirmed. That is not an isolated Docker sandbox. `/api/v1/graph-audits` stays the fixture API.
+
+Still open: multi-host Postgres resume, an isolated Docker verification worker, RAG on the graph path, and registering stdio MCP on the product tool router.
 
 See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md), [retro & audit](docs/implementation/m0-m11-retro-and-audit.md), [target architecture](docs/implementation/target-architecture.md).
 
@@ -163,8 +181,10 @@ docker compose up -d
 ```bash
 cd backend
 uv sync --extra dev
-uv run pytest tests/test_agent_*.py -q   # 121 passed expected
+uv run pytest tests/test_agent_*.py -q
 uv run python -m tests.evals.runner --ci
+# Includes test_agent_graph_r1.py and test_agent_product_r2.py.
+# Counts live in IMPLEMENTATION_STATUS.md for the run that produced them.
 ```
 
 ---
@@ -194,9 +214,10 @@ uv run python -m tests.evals.runner --ci
 
 - [x] Multi-Agent product path
 - [x] Agent Runtime M0–M11
-- [ ] Auth parity for `/graph-audits`
-- [ ] Wire tools / tracer / budget into graph nodes
-- [ ] True mid-graph resume
+- [x] JWT and owner checks on `/graph-audits`
+- [x] Tools, tracer, and budget inside graph nodes
+- [x] Single-host file-checkpoint resume on `/api/v1/agent-tasks`
+- [ ] Multi-host Postgres resume
 - [ ] Sandbox worker process (ADR-003)
 - [ ] Auto-fix / PR incremental audit
 

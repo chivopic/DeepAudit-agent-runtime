@@ -15,7 +15,10 @@ export function Header({
   isCancelling,
   onCancel,
   onExport,
-  onNewAudit
+  onNewAudit,
+  canResume = false,
+  onResume,
+  isResuming = false,
 }: HeaderProps) {
   return (
     <header className="flex-shrink-0 h-16 border-b border-border/50 flex items-center justify-between px-6 bg-card/80 backdrop-blur-md relative overflow-hidden">
@@ -61,6 +64,11 @@ export function Header({
                 {task.name || task.id.slice(0, 8)}
               </span>
               <StatusBadge status={task.status} />
+              {task.engine && (
+                <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">
+                  {task.engine === "graph" ? "LangGraph" : "ReAct"}
+                </span>
+              )}
             </div>
           </div>
         )}
@@ -68,6 +76,27 @@ export function Header({
 
       {/* Right side - Controls */}
       <div className="flex items-center gap-3 relative z-10">
+        {canResume && onResume && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onResume}
+            disabled={isResuming}
+            className="h-9 px-4 text-xs font-mono uppercase tracking-wider text-sky-400 hover:text-sky-300 bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/30 hover:border-sky-500/50 transition-all duration-300 disabled:opacity-50 rounded-md"
+          >
+            {isResuming ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />
+                <span>Resuming</span>
+              </>
+            ) : (
+              <>
+                <Play className="w-3.5 h-3.5 mr-2" />
+                <span>Resume</span>
+              </>
+            )}
+          </Button>
+        )}
         {isRunning && (
           <Button
             variant="ghost"

@@ -182,6 +182,8 @@ export default function Dashboard() {
         return <Badge className="cyber-badge-muted">已取消</Badge>;
       case 'paused':
         return <Badge className="cyber-badge-muted">已暂停</Badge>;
+      case 'partial':
+        return <Badge className="cyber-badge-muted">部分完成</Badge>;
       default:
         return <Badge className="cyber-badge-muted">待处理</Badge>;
     }

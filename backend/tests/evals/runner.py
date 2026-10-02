@@ -54,10 +54,13 @@ def case_to_request(case: EvalCase) -> AuditRequest:
 async def run_case(case: EvalCase, *, llm: Optional[FakeLLM] = None) -> EvalResult:
     """Run one eval case through the LangGraph skeleton with fixture files."""
     req = case_to_request(case)
+    extra: dict[str, Any] = {"fixture_files": case.files}
+    if case.cross_file:
+        extra["cross_file"] = True
     runtime = GraphRuntime(
         llm=llm or FakeLLM(),
         offline=True,
-        extra={"fixture_files": case.files},
+        extra=extra,
     )
     app = compile_audit_graph()
     state = empty_audit_state(audit_id=req.id, request=req, thread_id=req.id)

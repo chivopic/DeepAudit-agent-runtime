@@ -78,6 +78,26 @@ class TestProgressPercentage:
         task = _make_task(status=AgentTaskStatus.CANCELLED)
         assert task.progress_percentage == 0.0
 
+    def test_partial_returns_100_even_when_files_remain(self):
+        """A partial graph run has stopped. File coverage stays on analyzed_files."""
+        task = _make_task(
+            status=AgentTaskStatus.PARTIAL,
+            current_phase=AgentTaskPhase.ANALYSIS,
+            total_files=15,
+            analyzed_files=7,
+        )
+        assert task.progress_percentage == 100.0
+
+    def test_paused_keeps_the_analysis_position(self):
+        # 30 points of earlier phases + 50 * 7/15 = 53.333..., the frozen bar.
+        task = _make_task(
+            status=AgentTaskStatus.PAUSED,
+            current_phase=AgentTaskPhase.ANALYSIS,
+            total_files=15,
+            analyzed_files=7,
+        )
+        assert task.progress_percentage == pytest.approx(53.333333)
+
     # -- No phase set (no phase matches, all weights accumulate) -----------
 
     def test_no_phase_accumulates_all_weights(self):

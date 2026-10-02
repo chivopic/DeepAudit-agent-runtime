@@ -98,7 +98,10 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
   const executeCommand = useCallback((cmd: string) => {
     const trimmedCmd = cmd.trim().toLowerCase();
 
-    if (!trimmedCmd) return;
+    if (!trimmedCmd) {
+      onCompleteRef.current();
+      return;
+    }
 
     const command = COMMANDS[trimmedCmd];
 

@@ -30,6 +30,7 @@ class AgentTaskStatus:
     VERIFYING = "verifying"       # 验证阶段
     REPORTING = "reporting"       # 报告生成
     COMPLETED = "completed"       # 已完成
+    PARTIAL = "partial"           # 已结束，但没有看完所有文件
     FAILED = "failed"             # 失败
     CANCELLED = "cancelled"       # 已取消
     PAUSED = "paused"             # 已暂停
@@ -76,6 +77,19 @@ class AgentTask(Base):
     
     # Agent 配置
     agent_config = Column(JSON, nullable=True)  # Agent 特定配置
+
+    @property
+    def engine(self) -> str:
+        """Stored runtime. Missing key means the classic ReAct path."""
+        cfg = self.agent_config if isinstance(self.agent_config, dict) else {}
+        value = str((cfg or {}).get("engine") or "").strip().lower()
+        return value if value in {"graph", "react"} else "react"
+
+    @property
+    def graph_verification(self) -> bool:
+        cfg = self.agent_config if isinstance(self.agent_config, dict) else {}
+        return bool((cfg or {}).get("graph_verification"))
+
     max_iterations = Column(Integer, default=50)  # 最大迭代次数
     token_budget = Column(Integer, default=100000)  # Token 预算
     timeout_seconds = Column(Integer, default=1800)  # 超时时间（秒）
@@ -136,7 +150,7 @@ class AgentTask(Base):
     @property
     def progress_percentage(self) -> float:
         """计算进度百分比"""
-        if self.status == AgentTaskStatus.COMPLETED:
+        if self.status in (AgentTaskStatus.COMPLETED, AgentTaskStatus.PARTIAL):
             return 100.0
         if self.status in [AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED]:
             return 0.0

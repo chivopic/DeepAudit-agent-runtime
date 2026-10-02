@@ -275,6 +275,10 @@ export default function AuditTasks() {
         return <Badge className="cyber-badge-danger">失败</Badge>;
       case 'cancelled':
         return <Badge className="cyber-badge-muted">已取消</Badge>;
+      case 'partial':
+        return <Badge className="cyber-badge-muted">部分完成</Badge>;
+      case 'paused':
+        return <Badge className="cyber-badge-muted">已暂停</Badge>;
       default:
         return <Badge className="cyber-badge-muted">等待中</Badge>;
     }
@@ -286,6 +290,8 @@ export default function AuditTasks() {
       case 'running': return <Activity className="w-4 h-4 text-sky-400" />;
       case 'failed': return <AlertTriangle className="w-4 h-4 text-rose-400" />;
       case 'cancelled': return <XCircle className="w-4 h-4 text-muted-foreground" />;
+      case 'partial': return <AlertTriangle className="w-4 h-4 text-amber-400" />;
+      case 'paused': return <Clock className="w-4 h-4 text-sky-400" />;
       default: return <Clock className="w-4 h-4 text-muted-foreground" />;
     }
   };

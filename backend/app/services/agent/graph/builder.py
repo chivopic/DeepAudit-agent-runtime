@@ -8,8 +8,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from . import nodes
-from .routing import route_after_analyze, route_after_ingest, route_after_validate
+from .routing import (
+    route_after_analyze,
+    route_after_ingest,
+    route_after_prioritize,
+    route_after_validate,
+)
 from .state import AuditState
+from .verify_node import verify_audit_findings
 
 
 def build_audit_graph() -> StateGraph:
@@ -20,7 +26,7 @@ def build_audit_graph() -> StateGraph:
         START → validate_request → ingest_repository → build_manifest
               → static_scan → plan_audit → analyze_file* → aggregate_findings
               → deduplicate_findings → prioritize_findings
-              → generate_report → END
+              → (verify_audit_findings if enabled) → generate_report → END
     """
     g: StateGraph = StateGraph(AuditState)
 
@@ -33,6 +39,7 @@ def build_audit_graph() -> StateGraph:
     g.add_node("aggregate_findings", nodes.aggregate_findings)
     g.add_node("deduplicate_findings", nodes.deduplicate_findings)
     g.add_node("prioritize_findings", nodes.prioritize_findings)
+    g.add_node("verify_audit_findings", verify_audit_findings)
     g.add_node("generate_report", nodes.generate_report)
     g.add_node("finalize_cancelled", nodes.finalize_cancelled)
 
@@ -67,7 +74,15 @@ def build_audit_graph() -> StateGraph:
     )
     g.add_edge("aggregate_findings", "deduplicate_findings")
     g.add_edge("deduplicate_findings", "prioritize_findings")
-    g.add_edge("prioritize_findings", "generate_report")
+    g.add_conditional_edges(
+        "prioritize_findings",
+        route_after_prioritize,
+        {
+            "verify_audit_findings": "verify_audit_findings",
+            "generate_report": "generate_report",
+        },
+    )
+    g.add_edge("verify_audit_findings", "generate_report")
     g.add_edge("generate_report", END)
     g.add_edge("finalize_cancelled", END)
 

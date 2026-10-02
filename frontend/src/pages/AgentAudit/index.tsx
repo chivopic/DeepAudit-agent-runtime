@@ -15,6 +15,7 @@ import {
   getAgentTask,
   getAgentFindings,
   cancelAgentTask,
+  resumeAgentTask,
   getAgentTree,
   getAgentEvents,
   AgentEvent,
@@ -379,11 +380,15 @@ function AgentAuditPageContent() {
                 }
               });
             } else {
+              const severity = typeof event.metadata?.severity === 'string'
+                ? event.metadata.severity
+                : undefined;
               dispatch({
                 type: 'ADD_LOG',
                 payload: {
                   type: event.event_type === 'error' ? 'error' : 'info',
                   title: message,
+                  severity,
                   agentName,
                 }
               });
@@ -432,7 +437,7 @@ function AgentAuditPageContent() {
     includeToolCalls: true,
     // 🔥 使用 state 变量，确保在历史事件加载后能获取最新值
     afterSequence: afterSequence,
-    onEvent: (event: { type: string; message?: string; metadata?: { agent_name?: string; agent?: string } }) => {
+    onEvent: (event: { type: string; message?: string; metadata?: { agent_name?: string; agent?: string; severity?: string } }) => {
       if (event.metadata?.agent_name) {
         setCurrentAgentName(event.metadata.agent_name);
       }
@@ -487,6 +492,7 @@ function AgentAuditPageContent() {
             payload: {
               type: event.type === 'error' ? 'error' : 'info',
               title: message,
+              severity: typeof event.metadata?.severity === 'string' ? event.metadata.severity : undefined,
               agentName: getCurrentAgentName() || undefined,
             }
           });
@@ -599,8 +605,11 @@ function AgentAuditPageContent() {
         }
       });
     },
-    onComplete: () => {
-      dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: 'Audit completed successfully' } });
+    onComplete: (data) => {
+      const title = data?.message?.trim();
+      if (title) {
+        dispatch({ type: 'ADD_LOG', payload: { type: 'info', title } });
+      }
       loadTask();
       loadFindings();
       loadAgentTree();
@@ -680,7 +689,7 @@ function AgentAuditPageContent() {
     hasConnectedRef.current = true;
     console.log(`[AgentAudit] Connecting to stream (afterSequence will be passed via streamOptions)`);
     connectStream();
-    dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: 'Connected to audit stream' } });
+    dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: '已连上审计日志' } });
 
     return () => {
       console.log('[AgentAudit] Cleanup: disconnecting stream');
@@ -725,20 +734,38 @@ function AgentAuditPageContent() {
   const handleCancel = async () => {
     if (!taskId || isCancelling) return;
     setIsCancelling(true);
-    dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: 'Requesting task cancellation...' } });
+    dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: '正在取消这次审计' } });
 
     try {
       await cancelAgentTask(taskId);
-      toast.success("Task cancellation requested");
-      dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: 'Task cancellation confirmed' } });
+      toast.success("已请求取消");
+      dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: '已取消' } });
       await loadTask();
       disconnectStream();
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      toast.error(`Failed to cancel task: ${errorMessage}`);
-      dispatch({ type: 'ADD_LOG', payload: { type: 'error', title: `Failed to cancel: ${errorMessage}` } });
+      const errorMessage = error instanceof Error ? error.message : '未知错误';
+      toast.error(`取消失败：${errorMessage}`);
+      dispatch({ type: 'ADD_LOG', payload: { type: 'error', title: `取消失败：${errorMessage}` } });
     } finally {
       setIsCancelling(false);
+    }
+  };
+
+  const [isResuming, setIsResuming] = useState(false);
+
+  const handleResume = async () => {
+    if (!taskId || isResuming) return;
+    setIsResuming(true);
+    dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: '正在从上次停下的地方继续' } });
+    try {
+      await resumeAgentTask(taskId);
+      toast.success("已请求继续审计");
+      await loadTask();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '未知错误';
+      toast.error(`继续失败：${errorMessage}`);
+    } finally {
+      setIsResuming(false);
     }
   };
 
@@ -784,6 +811,12 @@ function AgentAuditPageContent() {
         onCancel={handleCancel}
         onExport={handleExportReport}
         onNewAudit={() => setShowCreateDialog(true)}
+        canResume={
+          task?.engine === "graph" &&
+          (task.status === "paused" || task.status === "failed")
+        }
+        onResume={handleResume}
+        isResuming={isResuming}
       />
 
       {/* Main content */}

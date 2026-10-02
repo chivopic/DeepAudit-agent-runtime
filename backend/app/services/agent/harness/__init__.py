@@ -23,6 +23,8 @@ from app.services.agent.observability import (
     SPAN_AUDIT_RUN,
     Tracer,
     get_tracer,
+    push_tracer,
+    reset_tracer_context,
     set_tracer,
 )
 from app.services.agent.tooling import ToolProtocol, ToolRegistry, default_tool_registry
@@ -53,10 +55,16 @@ class ModelRouter:
     """Selects an LLMGateway implementation for the run."""
 
     default: LLMGateway = field(default_factory=FakeLLM)
+    production: LLMGateway | None = None
 
     def resolve(self, spec: AgentSpec) -> LLMGateway:
-        # Phase 1: FakeLLM / injected gateway only (no paid models in default path)
-        return self.default
+        if spec.offline or spec.provider == "fake":
+            return self.default
+        if self.production is None:
+            raise RuntimeError(
+                "production model requested but ModelRouter has no gateway configured"
+            )
+        return self.production
 
 
 @dataclass
@@ -197,9 +205,16 @@ class AgentRuntime:
             )
 
         set_tracer(self.tracer)
+        tracer_token = push_tracer(self.tracer)
         # Ensure tools registry is materialised (side effect for callers/tests)
         _ = self.tools
 
+        try:
+            return await self._start_span(request)
+        finally:
+            reset_tracer_context(tracer_token)
+
+    async def _start_span(self, request: AuditRequest) -> AuditRunResult:
         with self.tracer.span(
             SPAN_AUDIT_RUN,
             **{

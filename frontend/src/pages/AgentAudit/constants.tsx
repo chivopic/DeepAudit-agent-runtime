@@ -9,7 +9,7 @@ import React from "react";
 import {
   Brain, Wrench, Target, Bug, Zap, Terminal,
   AlertTriangle, Shield, Search, FileCode,
-  CheckCircle2, XCircle, Clock, Loader2, Square, Bot,
+  CheckCircle2, XCircle, Clock, Loader2, Square, Bot, AlertCircle, PauseCircle,
   Cpu, Scan, FileSearch, ShieldCheck
 } from "lucide-react";
 
@@ -181,6 +181,16 @@ export const TASK_STATUS_CONFIG: Record<string, {
     bg: "bg-amber-600",
     icon: React.createElement(Square, { className: "w-3 h-3" }),
     text: "CANCELLED"
+  },
+  partial: {
+    bg: "bg-amber-600",
+    icon: React.createElement(AlertCircle, { className: "w-3 h-3" }),
+    text: "PARTIAL"
+  },
+  paused: {
+    bg: "bg-sky-600",
+    icon: React.createElement(PauseCircle, { className: "w-3 h-3" }),
+    text: "PAUSED"
   },
 };
 

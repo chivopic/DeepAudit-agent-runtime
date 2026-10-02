@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,115 @@ def _sync_budget_manager(runtime: GraphRuntime, budget: RunBudget) -> None:
     bm = runtime.budget_manager or runtime.extra.get("budget_manager")
     if bm is not None and hasattr(bm, "budget"):
         bm.budget = budget
+
+
+# What analyze_file actually sends to the model. Longer files are a coverage gap
+# until the context manager chunks them (later migration phase).
+_MODEL_PREVIEW_CHARS = 4000
+
+
+def _coverage_state(state: AuditState) -> dict[str, Any]:
+    """Copy the running coverage record so a node can append without aliasing."""
+    meta = state.get("meta") or {}
+    raw = meta.get("analysis_coverage") if isinstance(meta, dict) else None
+    cov: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    cov["succeeded"] = int(cov.get("succeeded") or 0)
+    cov["tool_errors"] = int(cov.get("tool_errors") or 0)
+    cov["planner_error"] = cov.get("planner_error")
+    for key in ("failed_units", "degraded_units", "skipped_units", "truncated_units"):
+        cov[key] = list(cov.get(key) or [])
+    for key in ("source_windows", "rejected_findings"):
+        if key in cov:
+            cov[key] = list(cov.get(key) or [])
+    return cov
+
+
+def _unit(task_id: str, path: str | None, reason: str) -> dict[str, Any]:
+    return {"task_id": task_id, "path": path, "reason": reason}
+
+
+def _units_for_ids(
+    plan: AuditPlan | None, task_ids: list[str], reason: str
+) -> list[dict[str, Any]]:
+    by_id = {task.id: task for task in plan.tasks} if plan is not None else {}
+    units: list[dict[str, Any]] = []
+    for task_id in task_ids:
+        task = by_id.get(task_id)
+        units.append(_unit(task_id, task.target_path if task is not None else None, reason))
+    return units
+
+
+def _structured_findings(text: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Parse a model payload.
+
+    Returns ``([], None)`` when the payload is valid but carries no finding list
+    (the offline ack ``{"ok": true}``). Returns ``(None, reason)`` when the
+    payload was supposed to be JSON and is not usable.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return [], None
+    if not (raw.startswith("{") or raw.startswith("[")):
+        return None, "model output is not JSON"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON: {exc.msg}"
+    if isinstance(parsed, dict):
+        findings = parsed.get("findings")
+        if isinstance(findings, list):
+            parsed = findings
+        else:
+            return [], None
+    if not isinstance(parsed, list):
+        return None, "structured findings are not a list"
+    rows: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            return None, "structured finding is not an object"
+        rows.append(item)
+    return rows, None
+
+
+def _candidates_from_model_rows(
+    task: AuditTaskSpec, rows: list[dict[str, Any]]
+) -> list[CandidateFinding]:
+    found: list[CandidateFinding] = []
+    for item in rows:
+        try:
+            line = int(item.get("line") or 1)
+        except (TypeError, ValueError):
+            line = 1
+        loc = SourceLocation(
+            file_path=task.target_path,
+            start_line=line,
+            end_line=line,
+        )
+        sev_raw = str(item.get("severity") or "medium").lower()
+        try:
+            sev = Severity(sev_raw)
+        except ValueError:
+            sev = Severity.MEDIUM
+        found.append(
+            CandidateFinding(
+                title=str(item.get("title") or "LLM finding"),
+                description=str(item.get("description") or item.get("title") or ""),
+                severity=sev,
+                location=loc,
+                evidence=[
+                    Evidence(
+                        kind="model",
+                        summary="llm candidate",
+                        location=loc,
+                        confidence=0.55,
+                    )
+                ],
+                confidence=0.55,
+                analyzer="llm",
+                source_task_id=task.id,
+            )
+        )
+    return found
 
 
 def _node_span(runtime: GraphRuntime, node_name: str, **attrs: Any):
@@ -641,8 +751,11 @@ async def plan_audit(state: AuditState, config: RunnableConfig | None = None) ->
     usage = state.get("usage") or ModelUsage()
     budget: RunBudget = state.get("budget") or req.budget.model_copy(deep=True)
     rationale = "priority by path heuristics"
+    plan_errors: list[NodeError] = []
+    coverage = _coverage_state(state)
     with _node_span(runtime, "plan_audit", **{"audit.id": state.get("audit_id")}):
-        # Optional LLM call (FakeLLM in tests) — counts against budget
+        # Optional LLM call (FakeLLM in tests) — counts against budget.
+        # A planner failure still falls through to the deterministic task list.
         if runtime.enable_model_calls:
             try:
                 resp = await runtime.llm.complete(
@@ -659,13 +772,31 @@ async def plan_audit(state: AuditState, config: RunnableConfig | None = None) ->
                         ),
                     ]
                 )
-                usage = usage.add(resp.usage)
+                usage = usage.add(resp.usage).add(ModelUsage(attempt_count=1, success_count=1))
                 tokens = resp.usage.total_tokens or 0
                 budget = budget.consume_model_call(tokens=tokens)
                 if resp.content:
                     rationale = f"llm:{resp.content[:200]}"
             except Exception as exc:  # noqa: BLE001 — planner must not fail hard
                 logger.warning("plan_audit llm failed: %s", exc)
+                usage = usage.add(
+                    ModelUsage(
+                        attempt_count=1,
+                        failure_count=1,
+                        unknown_token_calls=1,
+                    )
+                )
+                budget = budget.consume_model_call(tokens=0)
+                plan_errors.append(
+                    NodeError(
+                        code=NodeErrorCode.PLAN,
+                        node="plan_audit",
+                        message=f"planner model failed: {type(exc).__name__}",
+                        retriable=True,
+                        details={"error_type": type(exc).__name__},
+                    )
+                )
+                coverage["planner_error"] = f"{type(exc).__name__}: {exc}"[:300]
 
         tasks: list[AuditTaskSpec] = []
         for f in manifest.files:
@@ -676,21 +807,26 @@ async def plan_audit(state: AuditState, config: RunnableConfig | None = None) ->
                     analyzer=(
                         "llm"
                         if runtime.enable_model_calls and runtime.offline
-                        else "hybrid"
-                        if runtime.enable_model_calls
-                        else "static"
+                        else "hybrid" if runtime.enable_model_calls else "static"
                     ),
                     priority=f.priority,
                     max_tokens=min(4000, budget.remaining_tokens() or 4000),
+                    metadata={"role": "analysis"},
                 )
             )
         tasks.sort(key=lambda t: t.priority, reverse=True)
+        parallel = 1
+        if runtime.extra.get("enable_parallel_analysis"):
+            try:
+                parallel = max(1, min(int(runtime.extra.get("max_parallel_analyzers") or 1), 8))
+            except (TypeError, ValueError):
+                parallel = 1
 
         plan = AuditPlan(
             audit_id=state["audit_id"],
             tasks=tasks,
-            strategy="sequential",  # M2: sequential analyze loop
-            max_parallel=1,
+            strategy="file_parallel" if parallel > 1 else "sequential",
+            max_parallel=parallel,
             rationale=rationale,
         )
         # Single source of truth: graph budget → harness BudgetManager (no double-count).
@@ -702,8 +838,9 @@ async def plan_audit(state: AuditState, config: RunnableConfig | None = None) ->
         "pending_task_ids": [t.id for t in tasks],
         "usage": usage,
         "budget": budget,
+        "errors": plan_errors,
         "events": [_event("node.completed", "plan_audit", task_count=len(tasks))],
-        "meta": {"planned": True},
+        "meta": {"planned": True, "analysis_coverage": coverage},
     }
 
 
@@ -795,6 +932,71 @@ async def finalize_cancelled(state: AuditState, config: RunnableConfig | None = 
     }
 
 
+_in_analyze_batch: ContextVar[bool] = ContextVar("deepaudit_analyze_batch", default=False)
+
+
+async def _analyze_batch(
+    state: AuditState,
+    config: RunnableConfig | None,
+    pending: list[str],
+    width: int,
+) -> dict:
+    """Analyze up to ``width`` files inside one graph step."""
+    budget = state.get("budget")
+    remaining_calls = 10**6
+    if budget is not None and budget.max_model_calls > 0:
+        remaining_calls = max(0, budget.max_model_calls - budget.model_calls_used)
+    slots = max(1, min(width, len(pending), remaining_calls or 1))
+    batch = pending[:slots]
+    rest = pending[slots:]
+    token = _in_analyze_batch.set(True)
+    merged_candidates: list[Any] = []
+    merged_errors: list[Any] = []
+    merged_events: list[dict[str, Any]] = []
+    coverage: dict[str, Any] | None = None
+    usage = state.get("usage")
+    try:
+        current = dict(state)
+        for index, task_id in enumerate(batch):
+            current["pending_task_ids"] = [task_id]
+            if usage is not None:
+                current["usage"] = usage
+            delta = await analyze_file(current, config)
+            budget = delta.get("budget", budget)
+            usage = delta.get("usage", usage)
+            current["budget"] = budget
+            current["meta"] = delta.get("meta") or current.get("meta") or {}
+            merged_candidates.extend(delta.get("candidate_findings") or [])
+            merged_errors.extend(delta.get("errors") or [])
+            merged_events.extend(delta.get("events") or [])
+            meta = delta.get("meta") or {}
+            if isinstance(meta.get("analysis_coverage"), dict):
+                coverage = meta["analysis_coverage"]
+            analyzed_this = (
+                "current_task_id" in delta or "budget" in delta or bool(delta.get("candidate_findings"))
+            )
+            if not analyzed_this:
+                rest = list(batch[index:]) + rest
+                break
+            if budget is not None and budget.is_exhausted():
+                rest = list(batch[index + 1 :]) + rest
+                break
+    finally:
+        _in_analyze_batch.reset(token)
+    out: dict[str, Any] = {
+        "status": AuditStatus.ANALYZING,
+        "pending_task_ids": rest,
+        "candidate_findings": merged_candidates,
+        "errors": merged_errors,
+        "events": merged_events,
+        "budget": budget,
+        "usage": usage,
+    }
+    if coverage is not None:
+        out["meta"] = {"analysis_coverage": coverage}
+    return out
+
+
 async def analyze_file(state: AuditState, config: RunnableConfig | None = None) -> dict:
     """Analyze the next pending task; emit candidate findings.
 
@@ -821,6 +1023,10 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
     if budget.is_exhausted() or (
         runtime.budget_manager is not None and runtime.budget_manager.exhausted()
     ):
+        coverage = _coverage_state(state)
+        coverage["skipped_units"] = list(coverage["skipped_units"]) + _units_for_ids(
+            plan, pending, "budget_exhausted"
+        )
         return {
             "errors": [
                 NodeError(
@@ -828,11 +1034,25 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
                     node="analyze_file",
                     message="budget exhausted before analyze",
                     retriable=False,
+                    details={"skipped": len(pending)},
                 )
             ],
-            "events": [_event("node.failed", "analyze_file budget")],
-            "pending_task_ids": [],  # stop loop
+            "events": [_event("node.failed", "analyze_file budget", skipped=len(pending))],
+            "pending_task_ids": [],  # stop loop; unfinished ids are in coverage
+            "meta": {"analysis_coverage": coverage},
         }
+
+    if (
+        not _in_analyze_batch.get()
+        and len(pending) > 1
+        and runtime.extra.get("enable_parallel_analysis")
+    ):
+        try:
+            width = max(1, min(int(runtime.extra.get("max_parallel_analyzers") or 1), 8))
+        except (TypeError, ValueError):
+            width = 1
+        if width > 1:
+            return await _analyze_batch(state, config, pending, width)
 
     task_id = pending[0]
     rest = pending[1:]
@@ -850,6 +1070,8 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
         }
 
     tool_events: list[dict[str, Any]] = []
+    analyze_errors: list[NodeError] = []
+    tool_failed = False
     with _node_span(
         runtime,
         "analyze_file",
@@ -910,7 +1132,21 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
                         error=tout.error,
                     )
                 )
-                if tout.success and isinstance(tout.data, dict):
+                if not tout.success:
+                    tool_failed = True
+                    analyze_errors.append(
+                        NodeError(
+                            code=NodeErrorCode.TOOL,
+                            node="analyze_file",
+                            message=f"tool failed on {task.target_path}",
+                            retriable=True,
+                            details={
+                                "path": task.target_path,
+                                "error": (tout.error or "")[:300],
+                            },
+                        )
+                    )
+                elif isinstance(tout.data, dict):
                     hits = tout.data.get("hits") or []
                     if isinstance(hits, list):
                         for hit in hits[:20]:
@@ -941,89 +1177,237 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
             except Exception as exc:  # noqa: BLE001
                 logger.warning("analyze_file tool invoke failed: %s", exc)
                 tool_events.append(_event("tool.error", str(exc)[:200], path=task.target_path))
-
-        # Fake / real LLM enrichment
-        if runtime.enable_model_calls:
-            try:
-                from contextlib import nullcontext
-
-                from app.services.agent.observability import SPAN_LLM_CALL
-
-                tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
-                llm_cm = (
-                    tracer.span(
-                        SPAN_LLM_CALL,
-                        **{"path": task.target_path, "node": "analyze_file"},
+                analyze_errors.append(
+                    NodeError(
+                        code=NodeErrorCode.TOOL,
+                        node="analyze_file",
+                        message=f"tool failed on {task.target_path}: {type(exc).__name__}",
+                        retriable=True,
+                        details={"path": task.target_path, "error_type": type(exc).__name__},
                     )
-                    if tracer is not None
-                    else nullcontext()
                 )
-                with llm_cm:
-                    resp = await runtime.llm.complete(
-                        [
-                            LLMMessage(
-                                role="system",
-                                content=(
-                                    "Return JSON array of findings "
-                                    "[{title,description,severity,line}]."
-                                ),
-                            ),
-                            LLMMessage(
-                                role="user",
-                                content=json.dumps(
-                                    {
-                                        "path": task.target_path,
-                                        "content": content[:4000],
-                                    }
-                                ),
-                            ),
-                        ]
+                tool_failed = True
+
+        if (
+            runtime.extra.get("pattern_scan")
+            and tools is not None
+            and not budget.tool_calls_exhausted()
+        ):
+            try:
+                from app.services.agent.tooling import ToolInput
+
+                tout = await tools.invoke(
+                    ToolInput(
+                        name="pattern_scan",
+                        arguments={"path": task.target_path},
+                        audit_id=state.get("audit_id"),
                     )
-                usage = usage.add(resp.usage)
-                tokens = resp.usage.total_tokens or 0
-                budget = budget.consume_model_call(tokens=tokens)
-                # Parse optional structured findings from FakeLLM
-                text = (resp.content or "").strip()
-                if text.startswith("["):
-                    try:
-                        arr = json.loads(text)
-                        for item in arr:
-                            line = int(item.get("line") or 1)
-                            loc = SourceLocation(
-                                file_path=task.target_path,
-                                start_line=line,
-                                end_line=line,
-                            )
-                            sev_raw = str(item.get("severity") or "medium").lower()
-                            try:
-                                sev = Severity(sev_raw)
-                            except ValueError:
-                                sev = Severity.MEDIUM
-                            candidates.append(
-                                CandidateFinding(
-                                    title=str(item.get("title") or "LLM finding"),
-                                    description=str(
-                                        item.get("description") or item.get("title") or ""
-                                    ),
-                                    severity=sev,
-                                    location=loc,
-                                    evidence=[
-                                        Evidence(
-                                            kind="model",
-                                            summary="llm candidate",
-                                            location=loc,
-                                            confidence=0.55,
-                                        )
-                                    ],
-                                    confidence=0.55,
-                                    analyzer="llm",
-                                    source_task_id=task.id,
-                                )
-                            )
-                    except json.JSONDecodeError:
-                        pass
+                )
+                budget = budget.consume_tool_call()
+                tool_events.append(
+                    _event(
+                        "tool.call",
+                        "pattern_scan",
+                        success=tout.success,
+                        path=task.target_path,
+                        error=tout.error,
+                    )
+                )
+                if not tout.success:
+                    tool_failed = True
+                    analyze_errors.append(
+                        NodeError(
+                            code=NodeErrorCode.TOOL,
+                            node="analyze_file",
+                            message=f"pattern_scan failed on {task.target_path}",
+                            retriable=True,
+                            details={"path": task.target_path, "error": (tout.error or "")[:300]},
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("analyze_file llm failed: %s", exc)
+                logger.warning("analyze_file pattern_scan failed: %s", exc)
+                tool_failed = True
+                analyze_errors.append(
+                    NodeError(
+                        code=NodeErrorCode.TOOL,
+                        node="analyze_file",
+                        message=f"pattern_scan failed on {task.target_path}: {type(exc).__name__}",
+                        retriable=True,
+                        details={"path": task.target_path, "error_type": type(exc).__name__},
+                    )
+                )
+
+        # Model enrichment. Timeouts and bad payloads stay in state; they must
+        # not disappear into a log line and a completed zero-finding report.
+        # context_windows stays off unless the product runtime asks for ranges.
+        model_failed = False
+        invalid_output = False
+        model_called = False
+        rejected_locations: list[dict[str, Any]] = []
+        window_coverage: list[dict[str, Any]] = []
+        unread_windows: list[dict[str, Any]] = []
+        use_windows = bool(runtime.extra.get("context_windows"))
+        if use_windows:
+            from app.services.agent.graph.context_windows import iter_source_windows
+
+            source_windows = iter_source_windows(content, _MODEL_PREVIEW_CHARS)
+        else:
+            source_windows = [
+                {
+                    "start_line": 1,
+                    "end_line": 1,
+                    "text": content[:_MODEL_PREVIEW_CHARS],
+                    "truncated": len(content) > _MODEL_PREVIEW_CHARS,
+                }
+            ]
+        truncated = (not use_windows) and len(content) > _MODEL_PREVIEW_CHARS
+        if runtime.enable_model_calls:
+            for window_index, window in enumerate(source_windows):
+                if budget.is_exhausted() or (
+                    runtime.budget_manager is not None and runtime.budget_manager.exhausted()
+                ):
+                    unread_windows.extend(source_windows[window_index:])
+                    break
+                model_called = True
+                preview = str(window.get("text") or "")
+                window_truncated = bool(window.get("truncated"))
+                payload = {
+                    "path": task.target_path,
+                    "content": preview,
+                    "truncated": window_truncated if use_windows else truncated,
+                }
+                if use_windows:
+                    payload["start_line"] = window.get("start_line")
+                    payload["end_line"] = window.get("end_line")
+                try:
+                    from contextlib import nullcontext
+
+                    from app.services.agent.observability import SPAN_LLM_CALL
+
+                    tracer = runtime.get_tracer() if hasattr(runtime, "get_tracer") else None
+                    llm_cm = (
+                        tracer.span(
+                            SPAN_LLM_CALL,
+                            **{"path": task.target_path, "node": "analyze_file"},
+                        )
+                        if tracer is not None
+                        else nullcontext()
+                    )
+                    with llm_cm:
+                        resp = await runtime.llm.complete(
+                            [
+                                LLMMessage(
+                                    role="system",
+                                    content=(
+                                        "Return JSON array of findings "
+                                        "[{title,description,severity,line}]."
+                                    ),
+                                ),
+                                LLMMessage(role="user", content=json.dumps(payload)),
+                            ]
+                        )
+                    usage = usage.add(resp.usage).add(
+                        ModelUsage(attempt_count=1, success_count=1)
+                    )
+                    tokens = resp.usage.total_tokens or 0
+                    budget = budget.consume_model_call(tokens=tokens)
+                    rows, parse_error = _structured_findings(resp.content or "")
+                    if parse_error:
+                        invalid_output = True
+                        usage = usage.add(ModelUsage(invalid_output_count=1))
+                        analyze_errors.append(
+                            NodeError(
+                                code=NodeErrorCode.LLM,
+                                node="analyze_file",
+                                message=f"invalid model output for {task.target_path}",
+                                retriable=True,
+                                details={"path": task.target_path, "reason": parse_error},
+                            )
+                        )
+                    elif rows:
+                        if runtime.extra.get("validate_findings") and content:
+                            from app.services.agent.graph.context_windows import (
+                                validate_model_rows,
+                            )
+
+                            rows, rejected = validate_model_rows(
+                                rows, content, path=task.target_path
+                            )
+                            rejected_locations.extend(rejected)
+                        if rows:
+                            candidates.extend(_candidates_from_model_rows(task, rows))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("analyze_file llm failed: %s", exc)
+                    model_failed = True
+                    usage = usage.add(
+                        ModelUsage(
+                            attempt_count=1,
+                            failure_count=1,
+                            unknown_token_calls=1,
+                        )
+                    )
+                    budget = budget.consume_model_call(tokens=0)
+                    analyze_errors.append(
+                        NodeError(
+                            code=NodeErrorCode.LLM,
+                            node="analyze_file",
+                            message=f"model failed on {task.target_path}: {type(exc).__name__}",
+                            retriable=True,
+                            details={
+                                "path": task.target_path,
+                                "task_id": task_id,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                    )
+                    unread_windows.extend(source_windows[window_index + 1 :])
+                    break
+                window_coverage.append(
+                    {
+                        "path": task.target_path,
+                        "start_line": window.get("start_line"),
+                        "end_line": window.get("end_line"),
+                        "chars": len(preview),
+                    }
+                )
+                if not use_windows:
+                    break
+
+        coverage = _coverage_state(state)
+        if model_failed or invalid_output:
+            reason = "model_error" if model_failed else "invalid_model_output"
+            bucket = "degraded_units" if candidates else "failed_units"
+            coverage[bucket].append(_unit(task_id, task.target_path, reason))
+        elif tool_failed:
+            coverage["degraded_units"].append(_unit(task_id, task.target_path, "tool_error"))
+        else:
+            coverage["succeeded"] = int(coverage["succeeded"]) + 1
+        if tool_failed:
+            coverage["tool_errors"] = int(coverage["tool_errors"]) + 1
+        if truncated and model_called:
+            coverage["truncated_units"].append(
+                _unit(
+                    task_id,
+                    task.target_path,
+                    f"model saw {_MODEL_PREVIEW_CHARS} of {len(content)} chars",
+                )
+            )
+        if unread_windows:
+            first = unread_windows[0]
+            last = unread_windows[-1]
+            coverage["truncated_units"].append(
+                _unit(
+                    task_id,
+                    task.target_path,
+                    f"unread lines {first.get('start_line')}-{last.get('end_line')}",
+                )
+            )
+        if window_coverage:
+            coverage["source_windows"] = list(coverage.get("source_windows") or []) + window_coverage
+        if rejected_locations:
+            coverage["rejected_findings"] = (
+                list(coverage.get("rejected_findings") or []) + rejected_locations
+            )
 
         budget = budget.consume_file()
         _sync_budget_manager(runtime, budget)
@@ -1035,6 +1419,7 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
         "candidate_findings": candidates,
         "budget": budget,
         "usage": usage,
+        "errors": analyze_errors,
         "events": [
             _event(
                 "node.completed",
@@ -1045,6 +1430,7 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
             ),
             *tool_events,
         ],
+        "meta": {"analysis_coverage": coverage},
     }
 
 
@@ -1081,6 +1467,26 @@ async def aggregate_findings(state: AuditState, config: RunnableConfig | None = 
                 metadata={"source_task_id": c.source_task_id, **(c.metadata or {})},
             )
         )
+    runtime = get_runtime(config)
+    if runtime.extra.get("cross_file") and len(normalized) > 1:
+        grouped: dict[str, list[str]] = {}
+        for item in normalized:
+            key = item.rule_id or item.cwe_id or item.title
+            path = item.location.file_path if item.location else ""
+            if key and path and path not in grouped.setdefault(key, []):
+                grouped[key].append(path)
+        linked: list[Finding] = []
+        for item in normalized:
+            key = item.rule_id or item.cwe_id or item.title
+            path = item.location.file_path if item.location else ""
+            others = [other for other in grouped.get(key, []) if other != path]
+            if others:
+                meta = dict(item.metadata or {})
+                meta["related_paths"] = others
+                meta["role"] = "aggregation"
+                item = item.model_copy(update={"metadata": meta})
+            linked.append(item)
+        normalized = linked
     return {
         "status": AuditStatus.AGGREGATING,
         "normalized_findings": normalized,
@@ -1189,34 +1595,146 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
     scanner_incomplete = scanner_status in {"partial", "error"}
     manifest_limited = bool(meta.get("manifest_limited"))
     manifest_incomplete = bool(meta.get("manifest_incomplete"))
-    incomplete = (
+    cov = _coverage_state(state)
+    failed_units = list(cov["failed_units"])
+    degraded_units = list(cov["degraded_units"])
+    skipped_units = list(cov["skipped_units"])
+    truncated_units = list(cov["truncated_units"])
+    # The router stops the loop as soon as the budget is spent, so the next
+    # analyze node never runs to record the queue. Name those units here.
+    if budget_hit and pending:
+        known = {unit.get("task_id") for unit in skipped_units if isinstance(unit, dict)}
+        for unit in _units_for_ids(plan, pending, "budget_exhausted"):
+            if unit["task_id"] not in known:
+                skipped_units.append(unit)
+    manifest = state.get("manifest")
+    omitted_units: list[dict[str, Any]] = []
+    if manifest_limited and manifest is not None:
+        omitted_units = [
+            {"path": path, "reason": "file_budget"}
+            for path in list(getattr(manifest, "excluded_paths", None) or [])
+        ]
+    planner_error = cov.get("planner_error")
+    tool_errors = int(cov["tool_errors"])
+    succeeded = int(cov["succeeded"])
+    usage = state.get("usage") or ModelUsage()
+    source_windows = list(cov.get("source_windows") or [])
+    rejected_findings = list(cov.get("rejected_findings") or [])
+    model_unavailable = bool((state["request"].config or {}).get("model_unavailable"))
+    coverage_gap = bool(
+        failed_units
+        or degraded_units
+        or skipped_units
+        or truncated_units
+        or omitted_units
+        or planner_error
+        or tool_errors
+        or rejected_findings
+        or model_unavailable
+    )
+    scope_incomplete = (
         bool(pending)
         or scanner_incomplete
         or manifest_limited
         or manifest_incomplete
         or (budget_hit and planned > 0 and (budget.files_analyzed if budget else 0) < planned)
     )
-    strict = bool(state["request"].config.get("strict"))
-    terminal = (
-        AuditStatus.FAILED
-        if strict and scanner_status == "error"
-        else AuditStatus.PARTIAL
-        if incomplete
-        else AuditStatus.COMPLETED
+    # Model/tool gaps are incomplete even when the queue was drained.
+    incomplete = scope_incomplete or coverage_gap
+    # Every attempted unit failed and nothing usable was produced.
+    # Budget stops before any attempt stay partial, not failed.
+    closed_failure = (
+        planned > 0
+        and not final_findings
+        and succeeded == 0
+        and not degraded_units
+        and bool(failed_units or planner_error)
     )
-    if incomplete:
-        summary = (
-            f"Audit incomplete ({terminal.value}): scanner, budget, or scope limited run with "
-            f"{len(final_findings)} finding(s); "
-            f"{len(pending)} task(s) remaining. "
-            f"Phase 1: {not_run} finding(s) have verification_status=not_run."
-        )
+    strict = bool(state["request"].config.get("strict"))
+    if strict and scanner_status == "error":
+        terminal = AuditStatus.FAILED
+    elif closed_failure:
+        terminal = AuditStatus.FAILED
+    elif incomplete:
+        terminal = AuditStatus.PARTIAL
     else:
-        summary = (
-            f"Audit completed with {len(final_findings)} finding(s). "
+        terminal = AuditStatus.COMPLETED
+    unfinished = [
+        str(unit.get("path") or unit.get("task_id"))
+        for unit in (
+            failed_units + degraded_units + skipped_units + truncated_units + omitted_units
+        )
+        if isinstance(unit, dict)
+    ]
+    shown = ", ".join(unfinished[:20])
+    if len(unfinished) > 20:
+        shown = f"{shown}, and {len(unfinished) - 20} more"
+    gap_sentence = ""
+    if shown:
+        gap_sentence = f" Unfinished or degraded units: {shown}."
+    elif planner_error:
+        gap_sentence = " Planner model failed; deterministic plan was used."
+    if model_unavailable:
+        gap_sentence = (
+            f"{gap_sentence} No model API key was configured; pattern analysis ran without a model."
+        )
+    if rejected_findings:
+        gap_sentence = (
+            f"{gap_sentence} {len(rejected_findings)} model row(s) failed location or evidence checks."
+        )
+    confirmed = sum(
+        1 for f in final_findings if f.verification_status is VerificationStatus.CONFIRMED
+    )
+    if not_run == len(final_findings):
+        phase1 = (
             f"Phase 1: {not_run} finding(s) have verification_status=not_run "
             f"(no untrusted code execution)."
         )
+        verify_body = (
+            "Sandbox verification was **not run** in this phase. "
+            "Treat all results as unverified analysis signals."
+        )
+    else:
+        phase1 = (
+            f"In-process pattern confirmation: {confirmed} confirmed, {not_run} not_run. "
+            "This is not an isolated Docker worker."
+        )
+        verify_body = phase1
+    if terminal is AuditStatus.FAILED:
+        summary = (
+            f"Audit failed: analysis produced no usable result "
+            f"({len(failed_units)} failed unit(s), {len(final_findings)} finding(s))."
+            f"{gap_sentence} {phase1}"
+        )
+    elif incomplete:
+        summary = (
+            f"Audit incomplete (partial): scanner, budget, model, or scope limited run with "
+            f"{len(final_findings)} finding(s); "
+            f"{len(pending) + len(skipped_units)} task(s) not fully completed."
+            f"{gap_sentence} {phase1}"
+        )
+    else:
+        summary = f"Audit completed with {len(final_findings)} finding(s). {phase1}"
+    coverage_meta = {
+        "planned": planned,
+        "succeeded": succeeded,
+        "failed_units": failed_units,
+        "degraded_units": degraded_units,
+        "skipped_units": skipped_units,
+        "omitted_units": omitted_units,
+        "truncated_units": truncated_units,
+        "source_windows": source_windows,
+        "rejected_findings": rejected_findings,
+        "model_unavailable": model_unavailable,
+        "planner_error": planner_error,
+        "tool_errors": tool_errors,
+        "model_attempts": usage.attempt_count,
+        "model_successes": usage.success_count,
+        "model_failures": usage.failure_count,
+        "unknown_token_calls": usage.unknown_token_calls,
+        "invalid_outputs": usage.invalid_output_count,
+        "known_call_count": usage.call_count,
+    }
     sections = [
         AuditReportSection(
             title="Executive Summary",
@@ -1236,10 +1754,7 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
         ),
         AuditReportSection(
             title="Verification gaps",
-            body_markdown=(
-                "Sandbox verification was **not run** in this phase. "
-                "Treat all results as unverified analysis signals."
-            ),
+            body_markdown=verify_body,
             order=2,
         ),
     ]
@@ -1251,7 +1766,7 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
         sections=sections,
         findings=final_findings,
         plan=state.get("plan"),
-        usage=state.get("usage") or ModelUsage(),
+        usage=usage,
         metadata={
             "budget_exhausted": budget_hit,
             "pending_task_ids": pending,
@@ -1261,6 +1776,7 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
             "scanner_status": scanner_status,
             "scanner_coverage": meta.get("scanner_coverage"),
             "scanner_issues": meta.get("scanner_issues", []),
+            "coverage": coverage_meta,
         },
     ).recount_severities()
 

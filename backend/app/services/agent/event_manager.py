@@ -11,7 +11,17 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 import uuid
 
+from app.services.agent.config import get_agent_config
+
 logger = logging.getLogger(__name__)
+
+
+def _heartbeat_timeout_seconds() -> float:
+    """SSE idle wait. Tests and deployments override this via agent config."""
+    try:
+        return float(get_agent_config().sse_heartbeat_interval_seconds)
+    except Exception:  # noqa: BLE001 — streaming must not die if config import fails
+        return 30.0
 
 
 @dataclass
@@ -497,7 +507,9 @@ class EventManager:
             while True:
                 try:
                     logger.debug(f"[StreamEvents] Task {task_id}: Waiting for next event from queue...")
-                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=_heartbeat_timeout_seconds()
+                    )
                     logger.debug(f"[StreamEvents] Task {task_id}: Got event from queue: {event.get('event_type')}")
 
                     # 🔥 过滤掉序列号 <= after_sequence 的事件

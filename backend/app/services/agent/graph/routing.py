@@ -39,6 +39,16 @@ def route_after_analyze(
     return "aggregate_findings"
 
 
+def route_after_prioritize(
+    state: AuditState,
+) -> Literal["verify_audit_findings", "generate_report"]:
+    """Skip verification unless this request explicitly enabled it."""
+    request = state.get("request")
+    if request is not None and getattr(request, "enable_verification", False):
+        return "verify_audit_findings"
+    return "generate_report"
+
+
 def route_after_ingest(state: AuditState) -> Literal["build_manifest", "__end__"]:
     if state.get("status") is AuditStatus.FAILED:
         return "__end__"

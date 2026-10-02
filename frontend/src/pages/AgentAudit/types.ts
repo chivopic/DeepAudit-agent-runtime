@@ -123,6 +123,9 @@ export interface HeaderProps {
   onCancel: () => void;
   onExport: () => void;
   onNewAudit: () => void;
+  canResume?: boolean;
+  onResume?: () => void;
+  isResuming?: boolean;
 }
 
 export interface ActivityLogProps {

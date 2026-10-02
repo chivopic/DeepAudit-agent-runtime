@@ -11,7 +11,7 @@ from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
-CheckpointerBackend = Literal["memory", "sqlite", "auto"]
+CheckpointerBackend = Literal["memory", "sqlite", "file", "postgres", "auto"]
 
 
 class CheckpointerFactory:
@@ -22,13 +22,21 @@ class CheckpointerFactory:
         backend: CheckpointerBackend = "auto",
         *,
         sqlite_path: Optional[str] = None,
+        path: Optional[str] = None,
     ) -> None:
         self.backend = backend
         self.sqlite_path = sqlite_path or ":memory:"
+        self.path = path
 
     def create(self) -> Any:
         if self.backend == "memory":
             return self._memory()
+        if self.backend == "file":
+            return self._file()
+        if self.backend == "postgres":
+            raise RuntimeError(
+                "postgres checkpointer is not available; set AGENT_CHECKPOINT_BACKEND=file"
+            )
         if self.backend == "sqlite":
             return self._sqlite()
         # auto: prefer sqlite package if present, else memory
@@ -43,6 +51,13 @@ class CheckpointerFactory:
         from langgraph.checkpoint.memory import MemorySaver
 
         return MemorySaver()
+
+    def _file(self) -> Any:
+        if not self.path:
+            raise RuntimeError("file checkpointer requires a path")
+        from app.services.agent.persistence.file_checkpointer import FileCheckpointSaver
+
+        return FileCheckpointSaver(self.path)
 
     def _sqlite(self) -> Any:
         # Optional extra — may not be installed in this repo pin.
@@ -66,5 +81,6 @@ def create_checkpointer(
     backend: CheckpointerBackend = "memory",
     *,
     sqlite_path: Optional[str] = None,
+    path: Optional[str] = None,
 ) -> Any:
-    return CheckpointerFactory(backend=backend, sqlite_path=sqlite_path).create()
+    return CheckpointerFactory(backend=backend, sqlite_path=sqlite_path, path=path).create()

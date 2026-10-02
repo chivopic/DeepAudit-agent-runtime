@@ -5,7 +5,7 @@
  */
 
 import { memo } from "react";
-import { CheckCircle2, XCircle, Clock, Loader2, Square, AlertCircle } from "lucide-react";
+import { CheckCircle2, XCircle, Clock, Loader2, Square, AlertCircle, PauseCircle } from "lucide-react";
 
 interface StatusBadgeProps {
   status: string;
@@ -58,6 +58,20 @@ const STATUS_CONFIG: Record<string, {
     bg: "bg-yellow-100 dark:bg-yellow-950/60 border-yellow-600/50",
     text: "text-yellow-700 dark:text-yellow-400",
     label: "CANCELLED",
+  },
+  partial: {
+    icon: <AlertCircle className="w-3.5 h-3.5" />,
+    iconSm: <AlertCircle className="w-3 h-3" />,
+    bg: "bg-amber-100 dark:bg-amber-950/60 border-amber-600/50",
+    text: "text-amber-700 dark:text-amber-400",
+    label: "PARTIAL",
+  },
+  paused: {
+    icon: <PauseCircle className="w-3.5 h-3.5" />,
+    iconSm: <PauseCircle className="w-3 h-3" />,
+    bg: "bg-sky-100 dark:bg-sky-950/60 border-sky-600/50",
+    text: "text-sky-700 dark:text-sky-400",
+    label: "PAUSED",
   },
   error: {
     icon: <AlertCircle className="w-3.5 h-3.5" />,

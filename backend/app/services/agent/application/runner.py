@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -13,6 +14,7 @@ from app.services.agent.domain import (
     ModelUsage,
 )
 from app.services.agent.graph.builder import compile_audit_graph
+from app.services.agent.graph.limits import recursion_limit_for_budget
 from app.services.agent.graph.runtime import GraphRuntime, reset_runtime, set_runtime
 from app.services.agent.graph.state import empty_audit_state
 from app.services.agent.persistence.artifact_store import (
@@ -48,6 +50,36 @@ def _serialize_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     if usage is not None and hasattr(usage, "model_dump"):
         snap["usage"] = usage.model_dump()
     return snap
+
+
+async def _checkpoint_values(app: Any, audit_id: str) -> dict[str, Any]:
+    """Last successful graph checkpoint, if the checkpointer still has it."""
+    try:
+        snap = await app.aget_state({"configurable": {"thread_id": audit_id}})
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("checkpoint read failed: %s", exc)
+        return {}
+    values = getattr(snap, "values", None) if snap is not None else None
+    if not values:
+        return {}
+    return dict(values)
+
+
+async def _findings_from_checkpoint(values: dict[str, Any]) -> list[Finding]:
+    """Prefer normalized findings; otherwise promote candidates already produced."""
+    findings = list(values.get("normalized_findings") or [])
+    if findings:
+        return findings
+    if not values.get("candidate_findings"):
+        return []
+    try:
+        from app.services.agent.graph.nodes import aggregate_findings
+
+        aggregated = await aggregate_findings(values)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("candidate salvage failed: %s", exc)
+        return []
+    return list(aggregated.get("normalized_findings") or [])
 
 
 @dataclass
@@ -97,12 +129,26 @@ class AuditRunner:
     def is_cancelled(self, audit_id: str) -> bool:
         return bool(self._cancel_flags.get(audit_id))
 
+    def _invoke_config(self, audit_id: str, runtime: GraphRuntime, request: Optional[AuditRequest]) -> dict[str, Any]:
+        budget = request.budget if request is not None else None
+        limit = recursion_limit_for_budget(budget) if budget is not None else 50
+        return {
+            "recursion_limit": limit,
+            "durability": "sync",
+            "configurable": {
+                "thread_id": audit_id,
+                "runtime": runtime,
+            },
+        }
+
     async def run(
         self,
         request: AuditRequest,
         *,
         runtime: Optional[GraphRuntime] = None,
         audit_id: Optional[str] = None,
+        on_update: Optional[Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]] = None,
+        stop_when: Optional[Callable[[dict[str, Any]], bool]] = None,
     ) -> AuditRunResult:
         aid = audit_id or request.id
         runtime = runtime or GraphRuntime(offline=True)
@@ -121,31 +167,72 @@ class AuditRunner:
             return AuditRunResult(audit_id=aid, status=AuditStatus.CANCELLED)
 
         token = set_runtime(runtime)
+        app = None
         try:
             app = self._graph()
-            result = await app.ainvoke(
-                state,
-                {
-                    "configurable": {
-                        "thread_id": aid,
-                        "runtime": runtime,
-                    }
-                },
-            )
+            config = self._invoke_config(aid, runtime, request)
+            if on_update is None and stop_when is None:
+                result = await app.ainvoke(state, config)
+            else:
+                stopped = False
+                async for chunk in app.astream(state, config, stream_mode="updates"):
+                    values = await _checkpoint_values(app, aid)
+                    update = chunk if isinstance(chunk, dict) else {"update": chunk}
+                    if on_update is not None:
+                        await on_update(update, values)
+                    if stop_when is not None and stop_when(values):
+                        stopped = True
+                        break
+                if stopped:
+                    salvaged = await _checkpoint_values(app, aid)
+                    findings = await _findings_from_checkpoint(salvaged)
+                    usage = salvaged.get("usage")
+                    rec = await self.store.save_result(
+                        aid,
+                        status=AuditStatus.PAUSED,
+                        findings=findings,
+                        events=list(salvaged.get("events") or []),
+                        report=salvaged.get("report"),
+                        usage=usage if isinstance(usage, ModelUsage) else None,
+                        graph_snapshot=_serialize_snapshot(salvaged) if salvaged else None,
+                    )
+                    return AuditRunResult(
+                        audit_id=aid,
+                        status=AuditStatus.PAUSED,
+                        findings=findings,
+                        events=list(salvaged.get("events") or []),
+                        usage=usage if isinstance(usage, ModelUsage) else None,
+                        record=rec,
+                        raw_state=salvaged,
+                    )
+                result = await _checkpoint_values(app, aid)
         except Exception as exc:  # noqa: BLE001
             logger.exception("audit run failed: %s", aid)
+            salvaged = await _checkpoint_values(app, aid) if app is not None else {}
+            findings = await _findings_from_checkpoint(salvaged)
+            events = list(salvaged.get("events") or [])
+            events.append({"kind": "task.error", "message": str(exc)})
+            usage = salvaged.get("usage")
             rec = await self.store.save_result(
                 aid,
                 status=AuditStatus.FAILED,
-                findings=[],
-                events=[{"kind": "task.error", "message": str(exc)}],
+                findings=findings,
+                events=events,
+                report=salvaged.get("report"),
+                usage=usage if isinstance(usage, ModelUsage) else None,
+                graph_snapshot=_serialize_snapshot(salvaged) if salvaged else None,
                 error_message=str(exc),
             )
+            await self.store.upsert_findings(aid, findings)
             return AuditRunResult(
                 audit_id=aid,
                 status=AuditStatus.FAILED,
+                findings=findings,
                 events=rec.events,
+                report=salvaged.get("report"),
+                usage=usage if isinstance(usage, ModelUsage) else None,
                 record=rec,
+                raw_state=salvaged,
             )
         finally:
             reset_runtime(token)
@@ -231,7 +318,6 @@ class AuditRunner:
             AuditStatus.COMPLETED,
             AuditStatus.PARTIAL,
             AuditStatus.CANCELLED,
-            AuditStatus.FAILED,
         }:
             return AuditRunResult(
                 audit_id=audit_id,
@@ -243,34 +329,46 @@ class AuditRunner:
                 record=row,
             )
 
-        # Try live checkpointer state
-        app = self._graph()
-        cfg = {"configurable": {"thread_id": audit_id}}
+        # Non-terminal work continues from the last checkpoint. A second runner
+        # with the same checkpointer must not start the graph over.
+        runtime = runtime or GraphRuntime(offline=True)
+        runtime.cancel_check = lambda: self.is_cancelled(audit_id)
+        token = set_runtime(runtime)
+        app = None
         try:
-            snap = await app.aget_state(cfg)
-            if snap and snap.values and snap.values.get("status") is AuditStatus.COMPLETED:
-                result = snap.values
-                findings = list(result.get("normalized_findings") or [])
+            app = self._graph()
+            snap = await app.aget_state({"configurable": {"thread_id": audit_id}})
+            if snap and snap.values:
+                if snap.values.get("status") is AuditStatus.COMPLETED:
+                    result = snap.values
+                else:
+                    result = await app.ainvoke(
+                        None,
+                        self._invoke_config(audit_id, runtime, row.request),
+                    )
+                return await self._store_graph_result(audit_id, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("checkpoint resume failed: %s", audit_id)
+            salvaged = await _checkpoint_values(app, audit_id) if app is not None else {}
+            findings = await _findings_from_checkpoint(salvaged)
+            if findings or row.status is AuditStatus.PAUSED:
                 rec = await self.store.save_result(
                     audit_id,
-                    status=AuditStatus.COMPLETED,
-                    findings=findings,
-                    events=list(result.get("events") or []),
-                    report=result.get("report"),
-                    usage=result.get("usage"),
-                    graph_snapshot=_serialize_snapshot(result),
+                    status=AuditStatus.FAILED,
+                    findings=findings or list(row.findings),
+                    events=list(salvaged.get("events") or row.events),
+                    error_message=str(exc),
                 )
                 return AuditRunResult(
                     audit_id=audit_id,
-                    status=AuditStatus.COMPLETED,
-                    findings=findings,
+                    status=AuditStatus.FAILED,
+                    findings=findings or list(row.findings),
                     events=rec.events,
-                    report=result.get("report"),
                     record=rec,
-                    raw_state=result,
+                    raw_state=salvaged,
                 )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("aget_state resume miss: %s", exc)
+        finally:
+            reset_runtime(token)
 
         if row.request is None:
             raise RuntimeError(f"cannot resume {audit_id}: missing stored request")
@@ -279,6 +377,39 @@ class AuditRunner:
             row.request,
             runtime=runtime,
             audit_id=audit_id,
+        )
+
+    async def _store_graph_result(self, audit_id: str, result: dict[str, Any]) -> AuditRunResult:
+        status = result.get("status") or AuditStatus.COMPLETED
+        if not isinstance(status, AuditStatus):
+            try:
+                status = AuditStatus(str(status))
+            except ValueError:
+                status = AuditStatus.COMPLETED
+        if result.get("cancelled") or self.is_cancelled(audit_id):
+            status = AuditStatus.CANCELLED
+        findings = list(result.get("normalized_findings") or [])
+        events = list(result.get("events") or [])
+        usage = result.get("usage")
+        rec = await self.store.save_result(
+            audit_id,
+            status=status,
+            findings=findings,
+            events=events,
+            report=result.get("report"),
+            usage=usage if isinstance(usage, ModelUsage) else None,
+            graph_snapshot=_serialize_snapshot(result),
+        )
+        await self.store.upsert_findings(audit_id, findings)
+        return AuditRunResult(
+            audit_id=audit_id,
+            status=status,
+            findings=findings,
+            events=events,
+            report=result.get("report"),
+            usage=usage if isinstance(usage, ModelUsage) else None,
+            record=rec,
+            raw_state=result,
         )
 
     async def get(self, audit_id: str) -> Optional[PersistedAuditRecord]:

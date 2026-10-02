@@ -80,6 +80,8 @@ export default function CreateAgentTaskDialog({
   const [excludePatterns, setExcludePatterns] = useState(DEFAULT_EXCLUDES);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [engine, setEngine] = useState<"graph" | "react">("graph");
+  const [graphVerification, setGraphVerification] = useState(false);
 
   // ZIP 文件状态
   const [zipFile, setZipFile] = useState<File | null>(null);
@@ -203,6 +205,8 @@ export default function CreateAgentTaskDialog({
         exclude_patterns: excludePatterns,
         target_files: selectedFiles,
         verification_level: "sandbox",
+        engine,
+        graph_verification: engine === "graph" && graphVerification,
       });
 
       onOpenChange(false);
@@ -477,7 +481,34 @@ export default function CreateAgentTaskDialog({
         </div>
 
         {/* Footer */}
-        <div className="flex-shrink-0 flex justify-end gap-3 px-5 py-4 bg-muted border-t border-border">
+        <div className="flex-shrink-0 px-5 py-3 bg-muted border-t border-border space-y-2">
+          <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
+            <span className="uppercase tracking-wider text-muted-foreground">Engine</span>
+            <button
+              type="button"
+              onClick={() => setEngine("graph")}
+              className={`px-2 py-1 rounded border ${engine === "graph" ? "border-primary text-primary" : "border-border text-muted-foreground"}`}
+            >
+              LangGraph
+            </button>
+            <button
+              type="button"
+              onClick={() => setEngine("react")}
+              className={`px-2 py-1 rounded border ${engine === "react" ? "border-primary text-primary" : "border-border text-muted-foreground"}`}
+            >
+              ReAct
+            </button>
+            <label className={`inline-flex items-center gap-2 ${engine === "graph" ? "text-foreground" : "text-muted-foreground"}`}>
+              <input
+                type="checkbox"
+                checked={graphVerification}
+                disabled={engine !== "graph"}
+                onChange={(event) => setGraphVerification(event.target.checked)}
+              />
+              Pattern confirmation
+            </label>
+          </div>
+        <div className="flex justify-end gap-3">
           <Button
             variant="ghost"
             onClick={() => onOpenChange(false)}
@@ -503,6 +534,7 @@ export default function CreateAgentTaskDialog({
               </>
             )}
           </Button>
+        </div>
         </div>
       </DialogContent>
 
