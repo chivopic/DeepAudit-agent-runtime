@@ -126,6 +126,8 @@ backend/app/services/agent/
 | M0–M11 | Experimental runtime | Recorded complete (2026-07-24) |
 | R2–R5 | Product path on `/api/v1/agent-tasks` | Landed for one host (2026-10-02) |
 
+The current path uses serial file analysis and pinned source artifacts for resume. Input omissions produce partial coverage. See the [repair record](docs/REPAIR_2026-10-03.md); full product acceptance is pending.
+
 M0–M11 is the experimental runtime record. The create dialog now starts R2–R5. Checkpoint resume is a single-host file. M3 is not a Postgres checkpointer, and M7 is not a Docker worker.
 
 ### What a user can run
@@ -136,7 +138,7 @@ The activity log is short Chinese sentences: list files, match common dangerous 
 
 A `partial` progress bar is 100 because the run has stopped. File coverage stays `analyzed / total`, for example 7/15. A paused task keeps the phase-weighted position.
 
-With no model key the task stays partial and runs pattern scan only. The verification checkbox is off by default, so findings stay unconfirmed. Turning it on runs in-process pattern confirmation and can mark a hit confirmed. That is not an isolated Docker sandbox. `/api/v1/graph-audits` stays the fixture API.
+With no model key the task stays partial and runs pattern scan only. The verification checkbox is off by default, so findings stay unconfirmed. Turning it on rechecks static patterns. Results remain inconclusive and confidence does not increase. `/api/v1/graph-audits` stays the fixture API.
 
 Still open: multi-host Postgres resume, an isolated Docker verification worker, RAG on the graph path, and registering stdio MCP on the product tool router.
 

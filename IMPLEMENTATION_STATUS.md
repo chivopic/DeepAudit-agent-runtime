@@ -5,7 +5,7 @@
 
 ## Current milestone
 
-**R2–R5 single-host product path** · status: **LANDED** (2026-10-02)
+**R2–R5 single-host product path** · status: **LOCAL REGRESSIONS PASSED; PRODUCT ACCEPTANCE PENDING** (2026-10-07)
 
 New Agent audits go through the existing `/api/v1/agent-tasks` API. The server default is `engine=graph` (`AGENT_RUNTIME_ENGINE`). A client can still send `engine=react` and run the classic ReAct path. Old rows with no `agent_config.engine` stay on ReAct. `/api/v1/graph-audits` remains the fixture-only surface and still injects `FakeLLM()`.
 
@@ -13,11 +13,33 @@ M0–M11 stay recorded below as the experimental runtime. R1 stays the trustwort
 
 | ID | Title | Status |
 |----|-------|--------|
-| R1 | Execution trustworthiness | **Complete** (2026-10-02) |
-| R2 | Gateway, authorized snapshot, tools, source windows | **Landed** (2026-10-02). RAG is not wired. |
-| R3 | Durable resume on one host | **Landed** (2026-10-02). File checkpoint + sqlite business rows. Postgres checkpointer fails closed. No new Alembic graph store. |
-| R4 | `/api/v1/agent-tasks` on the graph runtime | **Landed** (2026-10-02). Create starts the run. `POST /{id}/resume` continues paused or failed graph tasks. Browser click-through was not run. |
-| R5 | Parallel batch, pattern confirmation, MCP stdio, evals | **Landed in-process** (2026-10-02). Docker worker is still a FAILED placeholder. Stdio MCP is tested and not registered on the product tool router. |
+| R1 | Execution trustworthiness | Local regressions pass; product acceptance remains pending. |
+| R2 | Gateway, authorized snapshot, tools, source windows | Bounded source artifacts, explicit omissions and glob exclusions. RAG is not wired. |
+| R3 | Durable resume on one host | File checkpoint + SQLite + pinned source artifacts. OS run lock, shared cancellation and event replay. Other product persistence backends fail closed. |
+| R4 | `/api/v1/agent-tasks` on the graph runtime | Create starts the run; paused/failed tasks resume the saved source. Authenticated browser and database acceptance is pending. |
+| R5 | Serial analysis, static recheck, experimental MCP | Serial execution; static recheck remains INCONCLUSIVE. True concurrency, isolated Docker verification and product MCP are not delivered. |
+
+## Repository entry points
+
+| Entry | Location | Current role |
+| --- | --- | --- |
+| Web product | `backend/` + `frontend/` | Existing Agent task API; defaults to LangGraph |
+| Graph CLI prototype | `backend/app/cli/` | Backend-dependent local runtime prototype |
+| Lightweight CLI | `cli/` | Separate package; standard library + external Semgrep; see [CLI README](cli/README.md) |
+
+Both Python distributions register the command `deepaudit`; use separate environments when installing both.
+
+## Acceptance corrections (2026-10-03)
+
+The 2026-10-02 acceptance report found real defects in the original product landing. [Repair record](docs/REPAIR_2026-10-03.md) maps A1–A9 to this working tree and records validation limits.
+
+Validation recorded on 2026-10-07: backend suite **1158 passed, 8 skipped** with PDF report tests excluded; focused runtime/product/event suite **176 passed**, including **38 new regressions**; offline evals **3/3**; frontend TypeScript passed. Real database/browser, container recovery and PDF acceptance remain pending.
+
+- Snapshots reject symlinks, preserve the exact requested scope, apply glob exclusions, and record file/byte limits and unreadable input. Reports show the full discovered scope and become partial when input was omitted.
+- Source content is a persistent artifact referenced by its hash. Resume uses that artifact, keeps progress/cancellation hooks, and refuses missing checkpoints or unverifiable legacy snapshots instead of silently restarting.
+- Static pattern rechecks remain inconclusive and do not increase confidence or mark findings verified. Plans report serial execution (`max_parallel=1`).
+- Product workers use an OS run lock before preparing a checkout or changing task state. Shared files carry cancellation and event replay; duplicate workers leave the current owner alone. Compose persists runtime files in a named volume.
+- Product assembly reads the configured backends and accepts `file` only. This is a single-host implementation; PostgreSQL graph persistence, distributed workers, RAG, production MCP and real Docker verification remain outstanding.
 
 **CLI-L1 lightweight extraction** · status: **IMPLEMENTED / DOGFOOD** (2026-08-20)
 
@@ -164,7 +186,9 @@ Ruff selectors `E,F,B,C4` are clean on `limits.py`, `runner.py`, and `graph/node
 
 Not verified in the R1 round: Postgres, Docker, a real model, the browser, the frontend build, and the CLI suite. WeasyPrint still cannot be imported here (`libgobject-2.0-0` is missing), so `tests/test_report_generator.py` was excluded from collection. That exclusion is an environment gap. It is not evidence that PDF export works or that the report code changed.
 
-## R2–R5 single-host product path (2026-10-02)
+## R2–R5 original landing (2026-10-02; historical)
+
+The following records the original implementation. The acceptance corrections above supersede its statements about verification, parallelism, leases and source loading.
 
 A user with a project and a model key can create an Agent audit from the existing dialog. The dialog defaults to LangGraph. Pattern confirmation is a checkbox and stays off. ReAct is the other engine button. Creating the task already schedules `_execute_agent_task`. There is still no `POST /{id}/start` route. Paused or failed graph tasks expose `POST /{id}/resume`.
 
@@ -277,7 +301,7 @@ harness/          # M11 AgentSpec + AgentRuntime
 
 - Removing the ReAct fallback (it stays available as `engine=react`)
 - SQLAlchemy persistence adapter for the graph business store (resume proof is the sqlite file)
-- Real Docker worker process (socket out of API). In-process pattern confirmation is the enabled verification path
+- Real Docker worker process (socket out of API). In-process pattern recheck stays inconclusive
 - Registering stdio MCP on the product tool router (transport is tested; InMemory transport remains the unit default)
 - Mandatory OTEL exporter install (optional bridge)
 - LLM-as-judge evals
@@ -289,7 +313,7 @@ harness/          # M11 AgentSpec + AgentRuntime
 |----|-------|----------|
 | K1 | Old tasks with no `engine` key still run ReAct. New tasks default to graph | Low |
 | K2 | docker.sock still on API compose | High (ADR-003; worker not deployed) |
-| K4 | Cancel mid-flight is cooperative/in-process | Medium |
+| K4 | Shared cancellation is cooperative; an in-flight model call finishes before the next unit is stopped | Medium |
 | K5 | Product checkpoints are a single-host file. Postgres is fail-closed | Medium |
 | K8 | CI gate added; fuller eval suite still local | Low |
 
@@ -306,4 +330,4 @@ Hardening applied after audit (same day):
 
 Phase 0/1 closed host-path LFI surface + async cancel race + MCP try-all + budget COMPLETED lie + mapper field loss.
 
-Still open (tracked in audit doc): full authz parity, harness enforcement inside nodes, true mid-graph resume, multi-worker event bus.
+The linked historical audit predates the product path. Current resume and event replay support workers sharing one host directory; distributed persistence and full product acceptance remain open.

@@ -18,7 +18,7 @@ _NODE_MESSAGES = {
     "aggregate_findings": "已把不同文件里的同类问题合并",
     "dedupe_findings": "已去掉重复的记录",
     "prioritize_findings": "已按严重程度排序",
-    "verify_audit_findings": "已做进程内的模式确认，这不是隔离沙箱",
+    "verify_audit_findings": "已复查代码模式，漏洞是否可利用仍需验证",
     "generate_report": "已整理审计结论",
 }
 
@@ -311,7 +311,14 @@ def _coverage_reason(coverage: dict[str, Any]) -> str:
     if coverage.get("truncated_units"):
         return "有的文件比较长，只读了前面一部分。"
     if coverage.get("omitted_units"):
-        return "有些文件超出本次数量上限，没有排进来。"
+        reasons = {
+            item.get("reason") for item in coverage["omitted_units"] if isinstance(item, dict)
+        }
+        if reasons <= {"file_budget"}:
+            return "有些文件超出本次数量上限，没有排进来。"
+        if reasons <= {"byte_budget"}:
+            return "有些文件超出本次源码大小上限，没有读入。"
+        return "有些源码未能读入，具体文件和原因已记录在报告的覆盖范围里。"
     rejected = coverage.get("rejected_findings") or []
     if isinstance(rejected, list) and rejected:
         return f"有 {len(rejected)} 条模型意见因为对不上代码位置，没有收进结果。"
@@ -322,9 +329,9 @@ def _coverage_reason(coverage: dict[str, Any]) -> str:
 
 def _verification_sentence(enabled: bool, verified_count: int) -> str:
     if enabled and verified_count:
-        return f"其中 {verified_count} 条和进程内的危险写法对上了。" "这还不是隔离环境里的复现。"
+        return f"报告保留了 {verified_count} 条已有的确认记录；本次模式复查不会新增确认。"
     if enabled:
-        return "做了进程内的模式确认，没有条目被标成已确认。这还不是隔离环境里的复现。"
+        return "已做代码模式复查，结果仍未确认，尚未在沙箱里复现。"
     return "这些结果还没有在沙箱里复现。"
 
 

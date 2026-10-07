@@ -7,6 +7,7 @@ open a database session and does not accept a client host path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 import uuid
@@ -21,11 +22,23 @@ from app.services.agent.application.activity_log import (
     user_outcome_message,
 )
 from app.services.agent.application.assembly import assemble_audit_runtime
-from app.services.agent.application.project_source import load_authorized_snapshot
+from app.services.agent.application.project_source import (
+    AuthorizedSnapshot,
+    ProjectSourceError,
+    load_authorized_snapshot,
+)
 from app.services.agent.application.runner import AuditRunner
-from app.services.agent.domain import AuditRequest, AuditStatus, RepositoryRef, RunBudget
+from app.services.agent.domain import (
+    ArtifactKind,
+    ArtifactRef,
+    AuditRequest,
+    AuditStatus,
+    RepositoryRef,
+    RunBudget,
+)
 from app.services.agent.domain.mappers import finding_to_legacy_dict
 from app.services.agent.graph.gateway import LLMServiceGateway
+from app.services.agent.persistence.artifact_store import FilesystemArtifactStore
 from app.services.agent.persistence.control import FileControlPlane
 from app.services.agent.persistence.file_checkpointer import FileCheckpointSaver
 from app.services.agent.persistence.sqlite_store import SqliteBusinessStore
@@ -48,66 +61,101 @@ async def run_product_graph_audit(
     event_sink: EventSink | None = None,
     state_dir: str | Path = "./data/agent_runtime",
     max_files: int = 100,
+    max_bytes: int = 2_000_000,
     token_budget: int = 100_000,
     resume: bool = False,
     owner: str | None = None,
+    control: FileControlPlane | None = None,
+    checkpoint_backend: str = "file",
+    control_backend: str = "file",
 ) -> dict[str, Any]:
     """Execute or continue a graph audit. Returns a JSON-friendly summary."""
     root = Path(project_root)
-    files = load_authorized_snapshot(
-        root,
-        max_files=max_files,
-        target_files=target_files,
-        exclude_patterns=exclude_patterns,
-    )
     state_root = Path(state_dir)
-    state_root.mkdir(parents=True, exist_ok=True)
-    control = FileControlPlane(state_root / "control")
+    validate_product_backends(checkpoint_backend, control_backend)
+    control = control or FileControlPlane(state_root / "control")
     holder = owner or f"worker-{uuid.uuid4().hex[:8]}"
     control.acquire(task_id, holder)
     started = time.monotonic()
     try:
+        artifacts = FilesystemArtifactStore(state_root / "artifacts")
+        store = SqliteBusinessStore(state_root / "audits.sqlite3")
+        if resume:
+            row = await store.get(task_id)
+            if row is None or row.request is None:
+                raise ProjectSourceError("找不到原审计记录，请新建任务。")
+            request = row.request
+            saved_ref = request.config.get("source_snapshot")
+            if not saved_ref:
+                raise ProjectSourceError("旧任务没有保存源码快照，请新建任务。")
+            ref = ArtifactRef.model_validate(saved_ref)
+            raw = await artifacts.get_bytes(ref)
+            if not ref.content_hash or hashlib.sha256(raw).hexdigest() != ref.content_hash:
+                raise ProjectSourceError("已保存的源码快照校验失败，请新建任务。")
+            snapshot = AuthorizedSnapshot.model_validate_json(raw)
+            graph_verification = request.enable_verification
+        else:
+            snapshot = load_authorized_snapshot(
+                root,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                target_files=target_files,
+                exclude_patterns=exclude_patterns,
+            )
+            ref = await artifacts.put(
+                snapshot.model_dump_json(),
+                kind=ArtifactKind.FULL_FILE,
+                media_type="application/json",
+                audit_id=task_id,
+                suffix=".json",
+            )
+            request = AuditRequest(
+                id=task_id,
+                repository=RepositoryRef(
+                    source_type="local",
+                    local_path="project://authorized",
+                    metadata={"project_root_name": root.name},
+                ),
+                budget=RunBudget(
+                    max_tokens=token_budget,
+                    max_model_calls=max(8, max_files * 2),
+                    max_files=max_files,
+                ),
+                enable_verification=graph_verification,
+                config={
+                    "engine": "graph",
+                    "source_snapshot": ref.model_dump(mode="json"),
+                    "source_coverage": snapshot.coverage(),
+                },
+            )
+        files = snapshot.files
+        files_total = snapshot.discovered_files
         gateway, gateway_note = _gateway_from_user_config(user_config)
         if gateway_note:
             await _emit(event_sink, gateway_note)
         runner = AuditRunner(
-            store=SqliteBusinessStore(state_root / "audits.sqlite3"),
+            store=store,
+            artifacts=artifacts,
             checkpointer=FileCheckpointSaver(state_root / "checkpoints" / f"{_safe(task_id)}.pkl"),
             checkpointer_backend="memory",
         )
-        if is_cancelled is not None:
-            runner.request_cancel(task_id) if is_cancelled() else None
-
         runtime_holder = assemble_audit_runtime(
             files=files,
             gateway=gateway,
             offline=gateway is None,
-            workspace_root=root,
-            parallel=2 if len(files) > 1 else 1,
+            parallel=1,
             cross_file=len(files) > 1,
             pattern_scan=True,
             verify=graph_verification,
             runner=runner,
         )
-        request = AuditRequest(
-            id=task_id,
-            repository=RepositoryRef(
-                source_type="local",
-                local_path="project://authorized",
-                metadata={"project_root_name": root.name},
-            ),
-            budget=RunBudget(
-                max_tokens=token_budget,
-                max_model_calls=max(8, max_files * 2),
-                max_files=max_files,
-            ),
-            enable_verification=graph_verification,
-            config={"engine": "graph", "model_unavailable": gateway is None},
-        )
+        if not resume:
+            request.config["model_unavailable"] = gateway is None
 
         seen_steps: set[str] = set()
 
         async def on_update(chunk: dict[str, Any], values: dict[str, Any]) -> None:
+            control.renew(task_id, holder)
             if is_cancelled is not None and is_cancelled():
                 runner.request_cancel(task_id)
             if not isinstance(chunk, dict):
@@ -115,7 +163,6 @@ async def run_product_graph_audit(
             for node_name in chunk:
                 if not isinstance(node_name, str) or node_name.startswith("__"):
                     continue
-                control.append_event(task_id, {"kind": "node", "message": node_name})
                 text = user_node_message(node_name, values, file_total=len(files))
                 if text is None:
                     continue
@@ -129,9 +176,11 @@ async def run_product_graph_audit(
                 await _emit(event_sink, text)
 
         graph_runtime = runtime_holder._build_runtime()
-        graph_runtime.cancel_check = is_cancelled
+        graph_runtime.cancel_check = lambda: control.is_cancelled(task_id) or bool(
+            is_cancelled and is_cancelled()
+        )
         if resume:
-            result = await runner.resume(task_id, runtime=graph_runtime)
+            result = await runner.resume(task_id, runtime=graph_runtime, on_update=on_update)
         else:
             result = await runner.run(
                 request,
@@ -156,7 +205,7 @@ async def run_product_graph_audit(
         user_message = user_outcome_message(
             status=task_status,
             files_analyzed=files_analyzed,
-            files_total=len(files),
+            files_total=files_total,
             findings=findings,
             duration_ms=duration_ms,
             coverage=_coverage_from_result(result),
@@ -168,16 +217,32 @@ async def run_product_graph_audit(
             "status": status.value,
             "task_status": task_status,
             "findings": findings,
-            "files_total": len(files),
+            "files_total": files_total,
             "files_analyzed": files_analyzed,
             "tokens": int(result.usage.total_tokens) if result.usage else 0,
             "error": error,
             "summary": result.report.summary if result.report else "",
             "duration_ms": duration_ms,
             "user_message": user_message,
+            "coverage": _coverage_from_result(result),
+            "source_snapshot_hash": ref.content_hash,
         }
     finally:
         control.release(task_id, holder)
+
+
+def validate_product_backends(checkpoint_backend: str, control_backend: str) -> None:
+    """The product currently supports durable execution on one host only."""
+    if checkpoint_backend != "file":
+        raise RuntimeError(
+            f"AGENT_CHECKPOINT_BACKEND={checkpoint_backend} is not supported by the product; "
+            "set AGENT_CHECKPOINT_BACKEND=file"
+        )
+    if control_backend != "file":
+        raise RuntimeError(
+            f"AGENT_CONTROL_BACKEND={control_backend} is not supported by the product; "
+            "set AGENT_CONTROL_BACKEND=file"
+        )
 
 
 def _gateway_from_user_config(

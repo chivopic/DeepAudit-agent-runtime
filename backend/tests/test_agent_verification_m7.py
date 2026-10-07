@@ -54,7 +54,7 @@ def test_verification_result_default_execution_not_succeeded():
 
 
 @pytest.mark.asyncio
-async def test_sandbox_confirm_with_allowlist():
+async def test_static_allowlist_hits_remain_inconclusive():
     files = {"app.py": "import os\nos.system(cmd)\n"}
     sb = LocalAllowlistExecutor(files=files)
     f = _finding()
@@ -64,9 +64,10 @@ async def test_sandbox_confirm_with_allowlist():
         allow_execution=True,
     )
     vf = await verify_one(f, request=req, sandbox=sb)
-    assert vf.verification_status is VerificationStatus.CONFIRMED
-    assert vf.status is FindingStatus.VERIFIED
-    assert vf.confidence >= f.confidence
+    assert vf.verification_status is VerificationStatus.INCONCLUSIVE
+    assert vf.status is not FindingStatus.VERIFIED
+    assert vf.confidence == f.confidence
+    assert vf.metadata["verification_method"] == "static_pattern_recheck"
 
 
 @pytest.mark.asyncio

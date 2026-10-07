@@ -43,6 +43,7 @@ services:
     volumes:
       # - ./backend/app:/app/app:ro  # 挂载代码目录，修改后自动生效
       - backend_uploads:/app/uploads
+      - agent_runtime_data:/app/data/agent_runtime
       - /var/run/docker.sock:/var/run/docker.sock # 沙箱执行必须
     ports:
       - "8000:8000"
@@ -52,6 +53,9 @@ services:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/deepaudit
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
+      - AGENT_STATE_DIR=/app/data/agent_runtime
+      - AGENT_CHECKPOINT_BACKEND=${AGENT_CHECKPOINT_BACKEND:-file}
+      - AGENT_CONTROL_BACKEND=${AGENT_CONTROL_BACKEND:-file}
       - SANDBOX_ENABLED=true
       - SANDBOX_IMAGE=deepaudit/sandbox:latest  # 使用本地构建的沙箱镜像
       # 禁用代理设置，防止容器内无法连接外部 API
@@ -136,4 +140,5 @@ networks:
 volumes:
   postgres_data:
   backend_uploads:
+  agent_runtime_data:
   redis_data:

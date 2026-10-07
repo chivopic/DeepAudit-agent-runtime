@@ -269,8 +269,9 @@ class EventManager:
     负责事件的存储和检索
     """
     
-    def __init__(self, db_session_factory=None):
+    def __init__(self, db_session_factory=None, *, event_log=None):
         self.db_session_factory = db_session_factory
+        self.event_log = event_log
         self._event_queues: Dict[str, asyncio.Queue] = {}
         self._event_callbacks: Dict[str, List[Callable]] = {}
     
@@ -309,6 +310,9 @@ class EventManager:
             "metadata": metadata,
             "timestamp": timestamp.isoformat(),
         }
+
+        if self.event_log is not None:
+            event_data["sequence"] = self.event_log.append_event(task_id, event_data)
         
         # 保存到数据库（跳过高频事件如 thinking_token）
         skip_db_events = {"thinking_token"}
@@ -453,6 +457,30 @@ class EventManager:
         """
         logger.info(f"[StreamEvents] Task {task_id}: Starting stream with after_sequence={after_sequence}")
 
+        if self.event_log is not None:
+            terminal_types = {"task_complete", "task_error", "task_cancel"}
+            idle = 0.0
+            while True:
+                events = self.event_log.read_events(task_id, after_sequence=after_sequence)
+                for event in events:
+                    after_sequence = int(event["sequence"])
+                    if event.get("event_type"):
+                        yield event
+                if events and events[-1].get("event_type") in terminal_types:
+                    return
+                if events:
+                    idle = 0.0
+                else:
+                    history = self.event_log.read_events(task_id)
+                    if history and history[-1].get("event_type") in terminal_types:
+                        return
+                    idle += 0.5
+                    if idle >= _heartbeat_timeout_seconds():
+                        yield {"event_type": "heartbeat", "timestamp": datetime.now(timezone.utc).isoformat()}
+                        idle = 0.0
+                await asyncio.sleep(0.5)
+            return
+
         # 获取现有队列（由 AgentRunner 在初始化时创建）
         queue = self._event_queues.get(task_id)
         if not queue:
@@ -556,4 +584,3 @@ class EventManager:
         self._event_callbacks.clear()
         
         logger.debug("EventManager closed")
-

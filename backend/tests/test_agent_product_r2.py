@@ -126,7 +126,9 @@ def test_snapshot_stays_inside_the_project(tmp_path: Path) -> None:
     (root / ".git").mkdir()
     (root / ".git" / "hidden.py").write_text("secret = 1\n", encoding="utf-8")
     files = load_authorized_snapshot(root)
-    assert files == {"app/a.py": "x = 1\n"}
+    assert files.files == {"app/a.py": "x = 1\n"}
+    assert files.discovered_files == 1
+    assert not files.issues
     with pytest.raises(ProjectSourceError):
         load_authorized_snapshot(root, target_files=["../outside.py"])
     with pytest.raises(ProjectSourceError):
@@ -186,7 +188,7 @@ async def test_context_windows_and_location_checks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_processes_resume_without_reanalyzing(tmp_path: Path) -> None:
+async def test_two_runners_resume_without_reanalyzing(tmp_path: Path) -> None:
     files = {"a.py": "a = 1\n", "b.py": "b = 2\n"}
     ckpt = tmp_path / "audit.pkl"
     store_path = tmp_path / "audits.sqlite3"
@@ -274,7 +276,8 @@ async def test_parallel_width_and_cross_file_links() -> None:
         ),
     )
     assert result.report.plan is not None
-    assert result.report.plan.max_parallel == 2
+    assert result.report.plan.max_parallel == 1
+    assert result.report.plan.strategy == "sequential"
     linked = [item for item in result.findings if (item.metadata or {}).get("related_paths")]
     assert linked
 
@@ -293,7 +296,8 @@ async def test_verification_stays_not_run_until_enabled() -> None:
         _request(enable_verification=True),
         runtime=GraphRuntime(llm=_PathLLM(), offline=True, extra={"fixture_files": files}),
     )
-    assert any(item.verification_status.value == "confirmed" for item in checked.findings)
+    assert checked.findings
+    assert all(item.verification_status.value == "inconclusive" for item in checked.findings)
 
 
 @pytest.mark.asyncio

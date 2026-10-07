@@ -328,7 +328,7 @@ async def ingest_repository(state: AuditState, config: RunnableConfig | None = N
     languages: set[str] = set()
     snapshot_path: str | None = None
 
-    if fixture_files:
+    if "fixture_files" in runtime.extra:
         for p, content in fixture_files.items():
             file_count += 1
             total_bytes += len(content.encode("utf-8"))
@@ -428,11 +428,12 @@ async def build_manifest(state: AuditState, config: RunnableConfig | None = None
 
     def _source_allowed(rel: str) -> bool:
         language = _lang_for(rel)
-        return Path(rel).suffix.lower() in _SOURCE_EXTS and (
-            not requested_languages or language in requested_languages
+        supported = (
+            bool(req.config.get("source_snapshot")) or Path(rel).suffix.lower() in _SOURCE_EXTS
         )
+        return supported and (not requested_languages or language in requested_languages)
 
-    if fixture_files:
+    if "fixture_files" in runtime.extra:
         for rel, content in sorted(fixture_files.items()):
             rel_n = rel.replace("\\", "/")
             if not _allowed(rel_n) or not _source_allowed(rel_n):
@@ -568,8 +569,9 @@ async def build_manifest(state: AuditState, config: RunnableConfig | None = None
     budget: RunBudget = state.get("budget") or req.budget
     discovered = len(files)
     limited = budget.max_files > 0 and discovered > budget.max_files
+    omitted_paths = [file.path for file in files[budget.max_files :]] if limited else []
     if limited:
-        excluded.extend(file.path for file in files[budget.max_files :])
+        excluded.extend(omitted_paths)
         files = files[: budget.max_files]
 
     manifest = RepositoryManifest(
@@ -581,6 +583,7 @@ async def build_manifest(state: AuditState, config: RunnableConfig | None = None
             "discovered": discovered,
             "excluded": len(excluded),
             "limited": limited,
+            "omitted_paths": omitted_paths,
             "incomplete": bool(manifest_issues),
             "issues": manifest_issues,
         },
@@ -815,18 +818,12 @@ async def plan_audit(state: AuditState, config: RunnableConfig | None = None) ->
                 )
             )
         tasks.sort(key=lambda t: t.priority, reverse=True)
-        parallel = 1
-        if runtime.extra.get("enable_parallel_analysis"):
-            try:
-                parallel = max(1, min(int(runtime.extra.get("max_parallel_analyzers") or 1), 8))
-            except (TypeError, ValueError):
-                parallel = 1
-
         plan = AuditPlan(
             audit_id=state["audit_id"],
             tasks=tasks,
-            strategy="file_parallel" if parallel > 1 else "sequential",
-            max_parallel=parallel,
+            # Multiple files in a graph step are still awaited serially.
+            strategy="sequential",
+            max_parallel=1,
             rationale=rationale,
         )
         # Single source of truth: graph budget → harness BudgetManager (no double-count).
@@ -941,7 +938,7 @@ async def _analyze_batch(
     pending: list[str],
     width: int,
 ) -> dict:
-    """Analyze up to ``width`` files inside one graph step."""
+    """Analyze up to ``width`` files serially inside one graph step."""
     budget = state.get("budget")
     remaining_calls = 10**6
     if budget is not None and budget.max_model_calls > 0:
@@ -973,7 +970,9 @@ async def _analyze_batch(
             if isinstance(meta.get("analysis_coverage"), dict):
                 coverage = meta["analysis_coverage"]
             analyzed_this = (
-                "current_task_id" in delta or "budget" in delta or bool(delta.get("candidate_findings"))
+                "current_task_id" in delta
+                or "budget" in delta
+                or bool(delta.get("candidate_findings"))
             )
             if not analyzed_this:
                 rest = list(batch[index:]) + rest
@@ -1306,9 +1305,7 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
                                 LLMMessage(role="user", content=json.dumps(payload)),
                             ]
                         )
-                    usage = usage.add(resp.usage).add(
-                        ModelUsage(attempt_count=1, success_count=1)
-                    )
+                    usage = usage.add(resp.usage).add(ModelUsage(attempt_count=1, success_count=1))
                     tokens = resp.usage.total_tokens or 0
                     budget = budget.consume_model_call(tokens=tokens)
                     rows, parse_error = _structured_findings(resp.content or "")
@@ -1403,7 +1400,9 @@ async def analyze_file(state: AuditState, config: RunnableConfig | None = None) 
                 )
             )
         if window_coverage:
-            coverage["source_windows"] = list(coverage.get("source_windows") or []) + window_coverage
+            coverage["source_windows"] = (
+                list(coverage.get("source_windows") or []) + window_coverage
+            )
         if rejected_locations:
             coverage["rejected_findings"] = (
                 list(coverage.get("rejected_findings") or []) + rejected_locations
@@ -1608,12 +1607,19 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
             if unit["task_id"] not in known:
                 skipped_units.append(unit)
     manifest = state.get("manifest")
-    omitted_units: list[dict[str, Any]] = []
+    source_coverage = dict(state["request"].config.get("source_coverage") or {})
+    omitted_units: list[dict[str, Any]] = list(source_coverage.get("omitted_units") or [])
     if manifest_limited and manifest is not None:
-        omitted_units = [
-            {"path": path, "reason": "file_budget"}
-            for path in list(getattr(manifest, "excluded_paths", None) or [])
-        ]
+        omitted_units.extend(
+            [
+                {"path": path, "reason": "file_budget"}
+                for path in manifest.stats.get("omitted_paths", [])
+            ]
+        )
+    omitted_units.extend(
+        {"path": issue.get("path"), "reason": issue.get("code")}
+        for issue in meta.get("manifest_issues", [])
+    )
     planner_error = cov.get("planner_error")
     tool_errors = int(cov["tool_errors"])
     succeeded = int(cov["succeeded"])
@@ -1679,9 +1685,7 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
             f"{gap_sentence} No model API key was configured; pattern analysis ran without a model."
         )
     if rejected_findings:
-        gap_sentence = (
-            f"{gap_sentence} {len(rejected_findings)} model row(s) failed location or evidence checks."
-        )
+        gap_sentence = f"{gap_sentence} {len(rejected_findings)} model row(s) failed location or evidence checks."
     confirmed = sum(
         1 for f in final_findings if f.verification_status is VerificationStatus.CONFIRMED
     )
@@ -1696,8 +1700,8 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
         )
     else:
         phase1 = (
-            f"In-process pattern confirmation: {confirmed} confirmed, {not_run} not_run. "
-            "This is not an isolated Docker worker."
+            f"Static pattern recheck: {confirmed} confirmed, {not_run} not_run. "
+            "Pattern matches remain inconclusive; exploitability was not verified."
         )
         verify_body = phase1
     if terminal is AuditStatus.FAILED:
@@ -1716,6 +1720,7 @@ async def generate_report(state: AuditState, config: RunnableConfig | None = Non
     else:
         summary = f"Audit completed with {len(final_findings)} finding(s). {phase1}"
     coverage_meta = {
+        "source": source_coverage,
         "planned": planned,
         "succeeded": succeeded,
         "failed_units": failed_units,

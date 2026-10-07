@@ -40,6 +40,7 @@ services:
     restart: unless-stopped
     volumes:
       - backend_uploads:/app/uploads
+      - agent_runtime_data:/app/data/agent_runtime
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
@@ -47,6 +48,9 @@ services:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/deepaudit
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
+      - AGENT_STATE_DIR=/app/data/agent_runtime
+      - AGENT_CHECKPOINT_BACKEND=${AGENT_CHECKPOINT_BACKEND:-file}
+      - AGENT_CONTROL_BACKEND=${AGENT_CONTROL_BACKEND:-file}
       - SANDBOX_ENABLED=true
       - SANDBOX_IMAGE=ghcr.io/lintsinghua/deepaudit-sandbox:latest
       # LLM 配置 - 请根据需要修改
@@ -116,4 +120,5 @@ networks:
 volumes:
   postgres_data:
   backend_uploads:
+  agent_runtime_data:
   redis_data:

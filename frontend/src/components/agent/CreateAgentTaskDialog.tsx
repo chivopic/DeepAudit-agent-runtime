@@ -505,7 +505,7 @@ export default function CreateAgentTaskDialog({
                 disabled={engine !== "graph"}
                 onChange={(event) => setGraphVerification(event.target.checked)}
               />
-              Pattern confirmation
+              Recheck patterns (unverified)
             </label>
           </div>
         <div className="flex justify-end gap-3">

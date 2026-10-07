@@ -19,7 +19,7 @@ from app.services.agent.sandbox import LocalAllowlistExecutor, NullSandboxExecut
 async def verify_audit_findings(
     state: AuditState, config: RunnableConfig | None = None
 ) -> dict[str, Any]:
-    """Confirm pattern hits in memory. Docker remains a separate placeholder."""
+    """Recheck patterns in memory, retaining an inconclusive verification status."""
     runtime = get_runtime(config)
     findings = list(state.get("normalized_findings") or [])
     files = dict(runtime.extra.get("fixture_files") or {})
