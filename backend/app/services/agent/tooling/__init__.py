@@ -118,6 +118,7 @@ class BuiltinToolAdapter:
             "list_files": self._list_files,
             "read_snippet": self._read_snippet,
             "heuristic_scan": self._heuristic_scan,
+            "pattern_scan": self._heuristic_scan,
             "echo": self._echo,
         }
         if allowed is not None:
@@ -128,6 +129,7 @@ class BuiltinToolAdapter:
             "list_files": "List known workspace file paths",
             "read_snippet": "Read a line range from a known file",
             "heuristic_scan": "Run pattern heuristics on a file",
+            "pattern_scan": "Run pattern heuristics on a file",
             "echo": "Echo a message (debug)",
         }
         return [

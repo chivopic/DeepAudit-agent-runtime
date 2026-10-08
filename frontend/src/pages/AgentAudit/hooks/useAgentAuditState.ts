@@ -282,7 +282,7 @@ export function useAgentAuditState() {
 
   const isComplete = useMemo(() => {
     const status = state.task?.status;
-    return status === 'completed' || status === 'failed' || status === 'cancelled';
+    return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'partial' || status === 'paused';
   }, [state.task?.status]);
 
   return {

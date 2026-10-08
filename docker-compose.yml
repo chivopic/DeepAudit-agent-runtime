@@ -46,6 +46,7 @@ services:
       # docker.sock deliberately NOT mounted here (ADR-003 #6) —
       # sandbox work goes to the sandbox-worker service.
       - /var/lib/deepaudit/workspace:/var/lib/deepaudit/workspace
+      - agent_runtime_data:/app/data/agent_runtime
     ports:
       - "8000:8000"
     env_file:
@@ -54,6 +55,9 @@ services:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/deepaudit
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
+      - AGENT_STATE_DIR=/app/data/agent_runtime
+      - AGENT_PRODUCT_CHECKPOINT_BACKEND=${AGENT_PRODUCT_CHECKPOINT_BACKEND:-file}
+      - AGENT_CONTROL_BACKEND=${AGENT_CONTROL_BACKEND:-file}
       - SANDBOX_ENABLED=true
       - SANDBOX_WORKER_URL=http://sandbox-worker:8900
       - SANDBOX_WORKER_TOKEN=${SANDBOX_WORKER_TOKEN:?set SANDBOX_WORKER_TOKEN in your .env}
@@ -166,4 +170,5 @@ networks:
 volumes:
   postgres_data:
   backend_uploads:
+  agent_runtime_data:
   redis_data:

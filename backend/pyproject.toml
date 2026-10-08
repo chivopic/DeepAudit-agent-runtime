@@ -116,6 +116,9 @@ Repository = "https://github.com/lintsinghua/DeepAudit"
 Issues = "https://github.com/lintsinghua/DeepAudit/issues"
 Changelog = "https://github.com/lintsinghua/DeepAudit/blob/main/CHANGELOG.md"
 
+[project.scripts]
+deepaudit = "app.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

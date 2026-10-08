@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from .state import AuditState
 from app.services.agent.domain import AuditStatus
+
+from .state import AuditState
 
 
 def route_after_validate(state: AuditState) -> Literal["ingest_repository", "__end__"]:
@@ -37,6 +38,20 @@ def route_after_analyze(
     if pending:
         return "analyze_file"
     return "aggregate_findings"
+
+
+def route_after_prioritize(
+    state: AuditState,
+) -> Literal["verify_audit_findings", "verify_findings", "generate_report"]:
+    """Skip verification unless this request explicitly enabled it."""
+    request = state.get("request")
+    if request is not None and getattr(request, "enable_verification", False):
+        from .runtime import get_runtime
+
+        if get_runtime().extra.get("graph_verification"):
+            return "verify_audit_findings"
+        return "verify_findings"
+    return "generate_report"
 
 
 def route_after_ingest(state: AuditState) -> Literal["build_manifest", "__end__"]:

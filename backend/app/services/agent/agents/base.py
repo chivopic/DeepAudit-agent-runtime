@@ -297,8 +297,8 @@ class BaseAgent(ABC):
         self._total_tokens = 0
         self._tool_calls = 0
         self._cancelled = False
-        
-        # 🔥 外部取消检查回调
+        # External cancel probe. Must exist before the first is_cancelled read;
+        # cancel() only sets the local flag and must not be the initializer.
         self._cancel_callback = None
 
         # 获取超时配置

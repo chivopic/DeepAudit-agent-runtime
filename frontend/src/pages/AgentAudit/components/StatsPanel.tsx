@@ -120,6 +120,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
   };
   const totalFindings = task.findings_count || 0;
   const progressPercent = task.progress_percentage || 0;
+  const runFinished = ['completed', 'partial', 'failed', 'cancelled', 'paused'].includes(task.status);
 
   // Determine score color
   const getScoreColor = (score: number) => {
@@ -156,13 +157,15 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
               style={{ width: `${progressPercent}%` }}
             />
             {/* Animated shine effect */}
-            <div
-              className="absolute inset-y-0 left-0 bg-gradient-to-r from-transparent via-white/30 to-transparent rounded-full"
-              style={{
-                width: `${progressPercent}%`,
-                animation: 'shine 2s ease-in-out infinite',
-              }}
-            />
+            {!runFinished && (
+              <div
+                className="absolute inset-y-0 left-0 bg-gradient-to-r from-transparent via-white/30 to-transparent rounded-full"
+                style={{
+                  width: `${progressPercent}%`,
+                  animation: 'shine 2s ease-in-out infinite',
+                }}
+              />
+            )}
             {/* Glow effect */}
             <div
               className="absolute inset-y-0 left-0 rounded-full blur-sm opacity-50"

@@ -56,6 +56,8 @@ export interface AgentTask {
   verification_level: string | null;
   exclude_patterns: string[] | null;
   target_files: string[] | null;
+  engine?: string | null;
+  graph_verification?: boolean;
 
   // 错误信息
   error_message: string | null;
@@ -117,6 +119,8 @@ export interface CreateAgentTaskRequest {
   max_iterations?: number;
   token_budget?: number;
   timeout_seconds?: number;
+  engine?: "graph" | "react";
+  graph_verification?: boolean;
 }
 
 export interface AgentTaskSummary {
@@ -181,6 +185,14 @@ export async function getAgentTask(taskId: string): Promise<AgentTask> {
  */
 export async function startAgentTask(taskId: string): Promise<{ message: string; task_id: string }> {
   const response = await apiClient.post(`/agent-tasks/${taskId}/start`);
+  return response.data;
+}
+
+/**
+ * Continue a paused or failed LangGraph audit.
+ */
+export async function resumeAgentTask(taskId: string): Promise<{ message: string; task_id: string }> {
+  const response = await apiClient.post(`/agent-tasks/${taskId}/resume`);
   return response.data;
 }
 

@@ -89,7 +89,15 @@ class ModelUsage(BaseModel):
     total_tokens: int = Field(default=0, ge=0)
     estimated_cost_usd: Optional[float] = Field(default=None, ge=0)
     latency_ms: Optional[int] = Field(default=None, ge=0)
+    # Successful responses whose token usage is known. Failures stay at 0 here.
     call_count: int = Field(default=0, ge=0)
+    # Every complete() invocation, including timeouts and invalid payloads.
+    attempt_count: int = Field(default=0, ge=0)
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    # Attempts that raised before the provider reported a token count.
+    unknown_token_calls: int = Field(default=0, ge=0)
+    invalid_output_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def fill_total(self) -> ModelUsage:
@@ -115,6 +123,11 @@ class ModelUsage(BaseModel):
                 else None
             ),
             call_count=self.call_count + other.call_count,
+            attempt_count=self.attempt_count + other.attempt_count,
+            success_count=self.success_count + other.success_count,
+            failure_count=self.failure_count + other.failure_count,
+            unknown_token_calls=self.unknown_token_calls + other.unknown_token_calls,
+            invalid_output_count=self.invalid_output_count + other.invalid_output_count,
         )
 
 

@@ -156,7 +156,7 @@ export function isTaskRunning(status: string | undefined): boolean {
  * Check if task is complete
  */
 export function isTaskComplete(status: string | undefined): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled';
+  return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'partial' || status === 'paused';
 }
 
 /**

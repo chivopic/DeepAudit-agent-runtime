@@ -7,7 +7,7 @@ test ever imports it.
     FakeLLM / ModelRouter   the graph path could not reach a real model
     severity_threshold      the API accepted the parameter and discarded it
     M7 verification         every finding stayed NOT_RUN whatever was asked
-    M11 harness             still unreferenced today
+    M11 harness             now wired by the product runtime assembly
 
 Unit tests cannot catch this: they import the thing themselves, so the thing is
 always reachable from where they stand. This test looks from production.
@@ -25,15 +25,7 @@ AGENT = APP / "services" / "agent"
 
 # Packages that are deliberately not wired yet. Adding to this set has to be a
 # conscious edit with a reason — that is the whole point of the test.
-KNOWN_UNWIRED: dict[str, str] = {
-    "harness": (
-        "M11 Agent Harness: AgentRuntime, ModelRouter, PermissionPolicy and "
-        "BudgetManager are referenced only by tests. graph_audits reaches the "
-        "real model through LLMServiceGateway instead, so ModelRouter — the "
-        "harness's intended wiring point — is still dead. Either connect it or "
-        "drop it; leaving it is what this test exists to make visible."
-    ),
-}
+KNOWN_UNWIRED: dict[str, str] = {}
 
 
 def _packages() -> list[str]:
@@ -85,8 +77,7 @@ def test_package_is_reachable_from_production(package):
 def test_the_unwired_list_is_not_a_dumping_ground():
     """A growing list of exceptions would defeat the check."""
     assert len(KNOWN_UNWIRED) <= 2, (
-        "More than two packages are knowingly unwired. That is a backlog, not "
-        "an exception list."
+        "More than two packages are knowingly unwired. That is a backlog, not " "an exception list."
     )
 
 

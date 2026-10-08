@@ -10,6 +10,7 @@ import os
 import re
 import zipfile
 import shutil
+from pathlib import Path
 from typing import Any, List, Optional, Dict, Set
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -17,12 +18,13 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import case
+from sqlalchemy import case, delete
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, Field
 
 from app.api import deps
+from app.core.config import settings
 from app.db.session import get_db, async_session_factory
 from app.models.agent_task import (
     AgentTask, AgentEvent, AgentFinding,
@@ -81,6 +83,13 @@ class AgentTaskCreate(BaseModel):
     # Agent 配置
     max_iterations: int = Field(50, ge=1, le=200, description="最大迭代次数")
     timeout_seconds: int = Field(1800, ge=60, le=7200, description="超时时间（秒）")
+    engine: Optional[str] = Field(
+        None, description="graph（默认）或 react。省略时服务端使用 graph"
+    )
+    graph_verification: bool = Field(
+        False,
+        description="开启后仅做进程内模式确认，不启动 Docker 沙箱",
+    )
 
 
 class AgentTaskResponse(BaseModel):
@@ -139,6 +148,8 @@ class AgentTaskResponse(BaseModel):
     
     # 错误信息
     error_message: Optional[str] = None
+    engine: Optional[str] = None
+    graph_verification: bool = False
     
     class Config:
         from_attributes = True
@@ -235,7 +246,134 @@ def is_task_cancelled(task_id: str) -> bool:
     return task_id in _cancelled_tasks
 
 
-async def _execute_agent_task(task_id: str):
+def _stored_engine(task: AgentTask) -> str:
+    cfg = task.agent_config if isinstance(task.agent_config, dict) else {}
+    engine = str((cfg or {}).get("engine") or "").strip().lower()
+    if engine in {"graph", "react"}:
+        return engine
+    return "react"
+
+
+async def _execute_graph_product(
+    *,
+    db: AsyncSession,
+    task: AgentTask,
+    task_id: str,
+    project_root: str,
+    user_config: Optional[Dict[str, Any]],
+    event_emitter: Any,
+    resume: bool,
+    control: Any = None,
+    owner: str | None = None,
+) -> None:
+    """Run the LangGraph product path and write the existing task tables."""
+    from app.core.config import settings
+    from app.services.agent.application.product_audit import run_product_graph_audit
+    from app.services.agent.persistence.control import LeaseBusy
+
+    cfg = task.agent_config if isinstance(task.agent_config, dict) else {}
+    try:
+        summary = await run_product_graph_audit(
+            task_id=task_id,
+            project_root=project_root,
+            user_config=user_config,
+            target_files=task.target_files,
+            exclude_patterns=task.exclude_patterns,
+            graph_verification=bool(cfg.get("graph_verification")),
+            is_cancelled=lambda: is_task_cancelled(task_id),
+            event_sink=event_emitter,
+            state_dir=settings.AGENT_STATE_DIR,
+            checkpoint_backend=settings.AGENT_PRODUCT_CHECKPOINT_BACKEND,
+            control_backend=settings.AGENT_CONTROL_BACKEND,
+            control=control,
+            owner=owner,
+            max_files=100,
+            token_budget=int(task.token_budget or settings.AGENT_TOKEN_BUDGET),
+            resume=resume,
+        )
+    except LeaseBusy as exc:
+        logger.info("Graph task already has an active owner: %s", exc)
+        return
+
+    findings = list(summary.get("findings") or [])
+    # Resume returns the full graph result. Replace rows so a second pass
+    # does not insert the same findings again or add severity counts twice.
+    await db.execute(delete(AgentFinding).where(AgentFinding.task_id == task_id))
+    # Graph locations were checked against the pinned source artifact.
+    saved = await _save_findings(db, task_id, findings)
+    await db.refresh(task)
+    task_status = str(summary.get("task_status") or "failed")
+    task.status = task_status
+    task.findings_count = saved
+    files_total = int(summary.get("files_total") or 0)
+    files_analyzed = int(summary.get("files_analyzed") or 0)
+    task.total_files = files_total
+    task.analyzed_files = files_analyzed
+    task.tokens_used = int(summary.get("tokens") or 0)
+    task.agent_config = {
+        **(task.agent_config or {}),
+        "graph_result": {
+            "coverage": summary.get("coverage") or {},
+            "source_snapshot_hash": summary.get("source_snapshot_hash"),
+            "summary": summary.get("summary") or "",
+        },
+    }
+    # Partial has already written its report. Leave the phase on analysis only
+    # when the run can still continue, so a paused task keeps its place.
+    still_in_analysis = task_status in {"paused", "failed"} or (
+        files_total > 0
+        and files_analyzed < files_total
+        and task_status not in {"completed", "partial"}
+    )
+    task.current_phase = (
+        AgentTaskPhase.ANALYSIS if still_in_analysis else AgentTaskPhase.REPORTING
+    )
+    task.verified_count = sum(1 for item in findings if item.get("is_verified"))
+    task.security_score = (
+        _calculate_security_score(findings) if task_status == "completed" else None
+    )
+    task.critical_count = 0
+    task.high_count = 0
+    task.medium_count = 0
+    task.low_count = 0
+    for item in findings:
+        severity = str(item.get("severity") or "").lower()
+        if severity == "critical":
+            task.critical_count = (task.critical_count or 0) + 1
+        elif severity == "high":
+            task.high_count = (task.high_count or 0) + 1
+        elif severity == "medium":
+            task.medium_count = (task.medium_count or 0) + 1
+        elif severity == "low":
+            task.low_count = (task.low_count or 0) + 1
+    if summary.get("error"):
+        task.error_message = str(summary["error"])[:1000]
+    if task_status in {"completed", "partial", "failed", "cancelled", "paused"}:
+        if task_status != "paused":
+            task.completed_at = datetime.now(timezone.utc)
+    await db.commit()
+    outcome = str(summary.get("user_message") or "").strip()
+    duration_ms = int(summary.get("duration_ms") or 0)
+    if task_status == "failed":
+        await event_emitter.emit_task_error(
+            str(summary.get("error") or "审计没有完成"),
+            message=outcome or None,
+        )
+    elif task_status == "cancelled":
+        await event_emitter.emit_task_cancelled(message=outcome or None)
+    elif task_status == "paused":
+        await event_emitter.emit_info(
+            outcome or "审计已暂停。已经得到的结果会保留，可以稍后继续。"
+        )
+    else:
+        await event_emitter.emit_task_complete(
+            findings_count=saved,
+            duration_ms=duration_ms,
+            message=outcome or None,
+        )
+
+
+async def _execute_agent_task(task_id: str, resume: bool = False):
     """
     在后台执行 Agent 任务 - 使用动态 Agent 树架构
     
@@ -245,27 +383,31 @@ async def _execute_agent_task(task_id: str):
     from app.services.agent.event_manager import EventManager, AgentEventEmitter
     from app.services.llm.service import LLMService
     from app.services.agent.core import agent_registry
-    from app.services.agent.tools import SandboxManager
     from app.core.config import settings
+    from app.services.agent.application.product_audit import validate_product_backends
+    from app.services.agent.persistence.control import FileControlPlane, LeaseBusy
     import time
-    
-    # 🔥 在任务最开始就初始化 Docker 沙箱管理器
-    # 这样可以确保整个任务生命周期内使用同一个管理器，并且尽早发现 Docker 问题
+
+    # Graph tasks do not need Docker. The ReAct path initializes the sandbox
+    # after the engine branch returns.
     logger.info(f"🚀 Starting execution for task {task_id}")
-    sandbox_manager = SandboxManager()
-    await sandbox_manager.initialize()
-    logger.info(f"🐳 Global Sandbox Manager initialized (Available: {sandbox_manager.is_available})")
+    sandbox_manager = None
 
     # 🔥 提前创建事件管理器，以便在克隆仓库和索引时发送实时日志
     from app.services.agent.event_manager import EventManager, AgentEventEmitter
     event_manager = EventManager(db_session_factory=async_session_factory)
     event_manager.create_queue(task_id)
     event_emitter = AgentEventEmitter(task_id, event_manager)
-    _running_event_managers[task_id] = event_manager
 
     async with async_session_factory() as db:
         orchestrator = None
         start_time = time.time()
+        # Only the classic ReAct path registers agents. A graph task must not
+        # wipe that process-wide registry when it finishes.
+        clear_agent_registry = False
+        graph_control = None
+        graph_owner = f"worker-{uuid4().hex}"
+        registered = False
 
         try:
             # 获取任务
@@ -280,6 +422,18 @@ async def _execute_agent_task(task_id: str):
                 logger.error(f"Project not found for task {task_id}")
                 return
 
+            if _stored_engine(task) == "graph":
+                validate_product_backends(
+                    settings.AGENT_PRODUCT_CHECKPOINT_BACKEND, settings.AGENT_CONTROL_BACKEND
+                )
+                graph_control = FileControlPlane(Path(settings.AGENT_STATE_DIR) / "control")
+                graph_control.acquire(task_id, graph_owner)
+                # Register and mutate product state only after acquiring the run.
+                event_manager.event_log = graph_control
+                task.agent_config = {**(task.agent_config or {}), "graph_event_log": True}
+            _running_event_managers[task_id] = event_manager
+            registered = True
+
             # 🔥 发送任务开始事件 - 使用 phase_start 让前端知道进入准备阶段
             await event_emitter.emit_phase_start("preparation", f"🚀 任务开始执行: {project.name}")
 
@@ -291,6 +445,21 @@ async def _execute_agent_task(task_id: str):
 
             # 获取用户配置（需要在获取项目根目录之前，以便传递 token）
             user_config = await _get_user_config(db, task.created_by)
+
+            if graph_control is not None and resume:
+                # The saved artifact is authoritative; no clone or checkout is needed.
+                await _execute_graph_product(
+                    db=db,
+                    task=task,
+                    task_id=task_id,
+                    project_root="project://authorized",
+                    user_config=user_config,
+                    event_emitter=event_emitter,
+                    resume=True,
+                    control=graph_control,
+                    owner=graph_owner,
+                )
+                return
 
             # 从用户配置中提取 token和SSH密钥（用于私有仓库克隆）
             other_config = (user_config or {}).get('otherConfig', {})
@@ -320,6 +489,21 @@ async def _execute_agent_task(task_id: str):
                 ssh_private_key=ssh_private_key,  # 🔥 新增SSH密钥
                 event_emitter=event_emitter,  # 🔥 新增
             )
+
+            if graph_control is not None:
+                # Preserve the user's exact scope, including missing targets.
+                await _execute_graph_product(
+                    db=db,
+                    task=task,
+                    task_id=task_id,
+                    project_root=project_root,
+                    user_config=user_config,
+                    event_emitter=event_emitter,
+                    resume=False,
+                    control=graph_control,
+                    owner=graph_owner,
+                )
+                return
 
             # 🔥 自动修正 target_files 路径
             # 如果发生了目录调整（例如 ZIP 解压后只有一层目录，root 被下移），
@@ -393,6 +577,15 @@ async def _execute_agent_task(task_id: str):
             if is_task_cancelled(task_id):
                 logger.info(f"[Cancel] Task {task_id} cancelled after project preparation")
                 raise asyncio.CancelledError("任务已取消")
+
+            from app.services.agent.tools import SandboxManager
+
+            clear_agent_registry = True
+            sandbox_manager = SandboxManager()
+            await sandbox_manager.initialize()
+            logger.info(
+                f"🐳 Global Sandbox Manager initialized (Available: {sandbox_manager.is_available})"
+            )
 
             # 创建 LLM 服务
             llm_service = LLMService(user_config=user_config)
@@ -624,6 +817,8 @@ async def _execute_agent_task(task_id: str):
                     await event_emitter.emit_error(result.error or "Unknown error")
                     logger.error(f"❌ Task {task_id} failed: {result.error}")
             
+        except LeaseBusy:
+            logger.info("Ignoring duplicate execution for graph task %s", task_id)
         except asyncio.CancelledError:
             logger.info(f"Task {task_id} cancelled")
             try:
@@ -632,6 +827,8 @@ async def _execute_agent_task(task_id: str):
                     task.status = AgentTaskStatus.CANCELLED
                     task.completed_at = datetime.now(timezone.utc)
                     await db.commit()
+                    if graph_control is not None and registered:
+                        await event_emitter.emit_task_cancelled()
             except Exception:
                 pass
                 
@@ -645,26 +842,32 @@ async def _execute_agent_task(task_id: str):
                     task.error_message = str(e)[:1000]
                     task.completed_at = datetime.now(timezone.utc)
                     await db.commit()
+                    if graph_control is not None and registered:
+                        await event_emitter.emit_task_error(str(e)[:1000])
             except Exception as db_error:
                 logger.error(f"Failed to update task status: {db_error}")
         
         finally:
             # 🔥 在清理之前保存 Agent 树到数据库
-            try:
-                async with async_session_factory() as save_db:
-                    await _save_agent_tree(save_db, task_id)
-            except Exception as save_error:
-                logger.error(f"Failed to save agent tree: {save_error}")
+            if clear_agent_registry:
+                try:
+                    async with async_session_factory() as save_db:
+                        await _save_agent_tree(save_db, task_id)
+                except Exception as save_error:
+                    logger.error(f"Failed to save agent tree: {save_error}")
 
             # 清理
-            _running_orchestrators.pop(task_id, None)
-            _running_tasks.pop(task_id, None)
-            _running_event_managers.pop(task_id, None)
-            _running_asyncio_tasks.pop(task_id, None)  # 🔥 清理 asyncio task
-            _cancelled_tasks.discard(task_id)  # 🔥 清理取消标志
+            if registered:
+                _running_orchestrators.pop(task_id, None)
+                _running_tasks.pop(task_id, None)
+                _running_event_managers.pop(task_id, None)
+                _running_asyncio_tasks.pop(task_id, None)
+                _cancelled_tasks.discard(task_id)
+            if graph_control is not None:
+                graph_control.release(task_id, graph_owner)
 
-            # 🔥 清理整个 Agent 注册表（包括所有子 Agent）
-            agent_registry.clear()
+            if clear_agent_registry:
+                agent_registry.clear()
 
             logger.debug(f"Task {task_id} cleaned up")
 
@@ -1261,11 +1464,8 @@ async def _save_findings(
                 type_enum = VulnerabilityType.DESERIALIZATION
 
             # 🔥 Handle file path (support multiple field names)
-            file_path = (
-                finding.get("file_path") or
-                finding.get("file") or
-                finding.get("location", "").split(":")[0] if ":" in finding.get("location", "") else finding.get("location")
-            )
+            location = finding.get("location") or ""
+            file_path = finding.get("file_path") or finding.get("file") or location.split(":")[0]
 
             # 🔥 v2.1: 文件路径验证 - 过滤幻觉发现
             if project_root and file_path:
@@ -1335,8 +1535,11 @@ async def _save_findings(
                     confidence = 0.5
 
             # 🔥 Handle verification status
-            is_verified = finding.get("is_verified", False)
-            if finding.get("verdict") == "confirmed":
+            is_verified = bool(finding.get("is_verified", False))
+            verification_mark = str(
+                finding.get("verification_status") or finding.get("verdict") or ""
+            ).lower()
+            if verification_mark == "confirmed":
                 is_verified = True
 
             # 🔥 Handle PoC information
@@ -1561,6 +1764,7 @@ async def create_agent_task(
         max_iterations=request.max_iterations or 50,
         timeout_seconds=request.timeout_seconds or 1800,
         created_by=current_user.id,
+        agent_config=_new_agent_config(request.engine, request.graph_verification),
     )
     
     db.add(task)
@@ -1603,11 +1807,7 @@ async def list_agent_tasks(
         query = query.where(AgentTask.project_id == project_id)
     
     if status:
-        try:
-            status_enum = AgentTaskStatus(status)
-            query = query.where(AgentTask.status == status_enum)
-        except ValueError:
-            pass
+        query = query.where(AgentTask.status == status)
     
     query = query.order_by(AgentTask.created_at.desc())
     query = query.offset(skip).limit(limit)
@@ -1707,6 +1907,8 @@ async def get_agent_task(
             "verification_level": task.verification_level,
             "exclude_patterns": task.exclude_patterns,
             "target_files": task.target_files,
+            "engine": task.engine,
+            "graph_verification": task.graph_verification,
         }
         
         return AgentTaskResponse(**response_data)
@@ -1732,8 +1934,25 @@ async def cancel_agent_task(
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权操作此任务")
 
-    if task.status in [AgentTaskStatus.COMPLETED, AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED]:
+    if task.status in {
+        AgentTaskStatus.COMPLETED, AgentTaskStatus.PARTIAL,
+        AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED,
+    }:
         raise HTTPException(status_code=400, detail="任务已结束，无法取消")
+
+    if _stored_engine(task) == "graph":
+        from app.core.config import settings
+        from app.services.agent.application.product_audit import validate_product_backends
+        from app.services.agent.persistence.control import FileControlPlane
+
+        validate_product_backends(settings.AGENT_PRODUCT_CHECKPOINT_BACKEND, settings.AGENT_CONTROL_BACKEND)
+        control = FileControlPlane(Path(settings.AGENT_STATE_DIR) / "control")
+        control.request_cancel(task_id)
+        _cancelled_tasks.add(task_id)
+        task.status = AgentTaskStatus.CANCELLED
+        task.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        return {"message": "已请求取消，当前分析结束后保留已有结果并停止", "task_id": task_id}
 
     # 🔥 0. 立即标记任务为已取消（用于前置操作的取消检查）
     _cancelled_tasks.add(task_id)
@@ -1768,6 +1987,45 @@ async def cancel_agent_task(
 
     logger.info(f"[Cancel] Task {task_id} cancelled successfully")
     return {"message": "任务已取消", "task_id": task_id}
+
+
+def _new_agent_config(engine: Optional[str], graph_verification: bool) -> Dict[str, Any]:
+    from app.core.config import settings
+
+    chosen = (engine or settings.AGENT_RUNTIME_ENGINE or "graph").strip().lower()
+    if chosen not in {"graph", "react"}:
+        chosen = "graph"
+    return {
+        "engine": chosen,
+        "graph_verification": bool(graph_verification) and chosen == "graph",
+    }
+
+
+@router.post("/{task_id}/resume")
+async def resume_agent_task(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Continue a paused or failed LangGraph audit from its checkpoint."""
+    task = await db.get(AgentTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    project = await db.get(Project, task.project_id)
+    if not project or project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作此任务")
+
+    if _stored_engine(task) != "graph":
+        raise HTTPException(status_code=400, detail="只有 LangGraph 任务可以继续")
+    if task.status == AgentTaskStatus.RUNNING:
+        raise HTTPException(status_code=409, detail="任务仍在运行")
+    if task.status not in {AgentTaskStatus.PAUSED, AgentTaskStatus.FAILED}:
+        raise HTTPException(status_code=400, detail="任务不在可继续状态")
+
+    background_tasks.add_task(_execute_agent_task, task.id, True)
+    return {"message": "任务继续执行", "task_id": task.id}
 
 
 @router.get("/{task_id}/events")
@@ -1903,6 +2161,13 @@ async def stream_agent_with_thinking(
         """生成增强版 SSE 事件流"""
         # 1. 检查任务是否在运行中 (内存)
         event_manager = _running_event_managers.get(task_id)
+        if _stored_engine(task) == "graph" and (task.agent_config or {}).get("graph_event_log"):
+            from app.core.config import settings
+            from app.services.agent.persistence.control import FileControlPlane
+
+            event_manager = EventManager(
+                event_log=FileControlPlane(Path(settings.AGENT_STATE_DIR) / "control")
+            )
         
         if event_manager:
             logger.debug(f"Stream {task_id}: Using in-memory event manager")
@@ -3237,6 +3502,10 @@ async def generate_audit_report(
         for i, f in enumerate(findings[:3]):  # Log first 3
             logger.debug(f"[Report] Finding {i+1}: severity='{f.severity}', title='{f.title[:50] if f.title else 'N/A'}'")
     
+    cfg = task.agent_config if isinstance(task.agent_config, dict) else {}
+    graph_result = cfg.get("graph_result") or {}
+    graph_coverage = graph_result.get("coverage") or {}
+
     if format == "json":
         # Enhanced JSON report with full metadata
         return {
@@ -3246,10 +3515,12 @@ async def generate_audit_report(
                 "project_name": project.name,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "task_status": task.status,
+                "source_snapshot_hash": graph_result.get("source_snapshot_hash"),
                 "duration_seconds": int((task.completed_at - task.started_at).total_seconds()) if task.completed_at and task.started_at else None,
             },
             "summary": {
                 "security_score": task.security_score,
+                "total_files": task.total_files,
                 "total_files_analyzed": task.analyzed_files,
                 "total_findings": len(findings),
                 "verified_findings": sum(1 for f in findings if f.is_verified),
@@ -3265,6 +3536,7 @@ async def generate_audit_report(
                     "tokens_used": task.tokens_used,
                 }
             },
+            "coverage": graph_coverage,
             "findings": [
                 {
                     "id": f.id,
@@ -3336,6 +3608,20 @@ async def generate_audit_report(
     md_lines.append("## 执行摘要")
     md_lines.append("")
 
+    if graph_result:
+        md_lines.append("### 审计覆盖范围")
+        md_lines.append("")
+        md_lines.append(f"已分析 {task.analyzed_files} / {task.total_files} 个文件。")
+        if task.status != AgentTaskStatus.COMPLETED:
+            md_lines.append("**本次审计未完整完成，未发现问题不能作为项目安全的结论。**")
+        snapshot_hash = graph_result.get("source_snapshot_hash")
+        if snapshot_hash:
+            md_lines.append(f"源码快照 SHA-256：`{snapshot_hash}`")
+        for unit in graph_coverage.get("omitted_units") or []:
+            path = json.dumps(str(unit.get("path") or ""), ensure_ascii=False)
+            md_lines.append(f"- 未读入：{path}；原因：{unit.get('reason', 'unknown')}")
+        md_lines.append("")
+
     score = task.security_score
     if score is not None:
         if score >= 80:
@@ -3384,7 +3670,10 @@ async def generate_audit_report(
     if not findings:
         md_lines.append("## 漏洞详情")
         md_lines.append("")
-        md_lines.append("*本次审计未发现安全漏洞。*")
+        if graph_result and task.status != AgentTaskStatus.COMPLETED:
+            md_lines.append("*已分析范围内没有记录具体问题；审计仍有未完成部分。*")
+        else:
+            md_lines.append("*本次审计未发现安全漏洞。*")
         md_lines.append("")
     else:
         # Group findings by severity

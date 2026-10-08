@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 
+from app.services.agent.config import get_agent_config
+
 from .state import AgentState, AgentStatus
 from .registry import agent_registry
 from .message import message_bus, MessageType
@@ -88,7 +90,7 @@ class DynamicAgentExecutor:
         tools: Dict[str, Any],
         event_emitter=None,
         max_parallel: int = 5,
-        default_timeout: int = 600,
+        default_timeout: Optional[int] = 600,
     ):
         """
         初始化执行器
@@ -104,6 +106,8 @@ class DynamicAgentExecutor:
         self.tools = tools
         self.event_emitter = event_emitter
         self.max_parallel = max_parallel
+        if default_timeout is None:
+            default_timeout = get_agent_config().sub_agent_timeout_seconds
         self.default_timeout = default_timeout
         
         # 执行状态

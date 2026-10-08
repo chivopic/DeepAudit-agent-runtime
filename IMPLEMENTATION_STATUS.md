@@ -5,9 +5,65 @@
 
 ## Current milestone
 
-**Post-M11 Codex Phase 0/1 hardening** · status: **COMPLETE** (2026-07-24)
+**R2–R5 single-host product path + main integration** · status: **INTEGRATED; CI AND PRODUCT ACCEPTANCE PENDING** (2026-10-08)
 
-M0–M11 remains complete. Phase 0/1 trust + async + budget/MCP/mapper fixes landed same day.
+New Agent audits go through the existing `/api/v1/agent-tasks` API. The server default is `engine=graph` (`AGENT_RUNTIME_ENGINE`). A client can still send `engine=react` and run the classic ReAct path. Old rows with no `agent_config.engine` stay on ReAct. `/api/v1/graph-audits` defaults to `FakeLLM`, also supports server-resolved projects with mandatory ACL checks, and can opt into the real gateway via `GRAPH_AUDITS_USE_REAL_LLM`.
+
+M0–M11 stay recorded below as the experimental runtime. R1 stays the trustworthiness baseline. R2–R5 are the product path in the existing create dialog. The merged main also supplies a generic Postgres checkpointer and a separate sandbox worker. Product graph recovery still uses a single-host file store, and its verification checkbox performs a static recheck.
+
+| ID | Title | Status |
+|----|-------|--------|
+| R1 | Execution trustworthiness | Local regressions pass; product acceptance remains pending. |
+| R2 | Gateway, authorized snapshot, tools, source windows | Bounded source artifacts, explicit omissions and glob exclusions. RAG is not wired. |
+| R3 | Durable resume on one host | File checkpoint + SQLite + pinned source artifacts. OS run lock, shared cancellation and event replay. Other product persistence backends fail closed. |
+| R4 | `/api/v1/agent-tasks` on the graph runtime | Create starts the run; paused/failed tasks resume the saved source. Authenticated browser and database acceptance is pending. |
+| R5 | Serial analysis, static recheck, experimental MCP | Serial execution; static recheck remains INCONCLUSIVE. The sandbox worker exists for legacy sandbox calls; product graph Docker verification, true concurrency and product MCP remain pending. |
+
+## Main integration (2026-10-08)
+
+The merge combines `c3255ab` (main) and `e809a6e` (product repairs and CLI).
+
+- Generic runner checkpoints retain `AGENT_CHECKPOINT_BACKEND=auto|postgres|memory` and the async Postgres factory. Product recovery uses **`AGENT_PRODUCT_CHECKPOINT_BACKEND=file`**, `AGENT_CONTROL_BACKEND=file`, and the shared `AGENT_STATE_DIR`. The separate setting avoids overriding either path's backend policy.
+- Run/resume share result persistence; streaming progress, cancellation hooks, pinned product source and failure salvage are retained. Both existing verification node names remain available for saved checkpoints.
+- Local import context, CWE deduplication, defence-note filtering and severity thresholds from main are combined with source windows, model-error accounting and coverage reporting. Snapshot-backed analysis never reads omitted imports from a live checkout.
+- All three Compose files keep the sandbox worker's Docker socket and add the product runtime volume to the API. CI retains the full backend suite, smoke audit and evals.
+- The test figures below describe the feature branch before this merge. Tests have not been rerun locally for the merge; its CI result is pending.
+- Merge checks passed: Python syntax for 73 changed files, Ruff for six integrated core modules, endpoint undefined-name checks, Black for eight touched modules, MyPy for runner/builder/routing/product assembly, frontend TypeScript, and Compose/YAML structure. Legacy API lint findings remain outside this merge. Full MyPy checking of the Postgres adapter is limited by missing local `langgraph-checkpoint-postgres` / `psycopg_pool` packages.
+
+## Repository entry points
+
+| Entry | Location | Current role |
+| --- | --- | --- |
+| Web product | `backend/` + `frontend/` | Existing Agent task API; defaults to LangGraph |
+| Graph CLI prototype | `backend/app/cli/` | Backend-dependent local runtime prototype |
+| Lightweight CLI | `cli/` | Separate package; standard library + external Semgrep; see [CLI README](cli/README.md) |
+
+Both Python distributions register the command `deepaudit`; use separate environments when installing both.
+
+## Acceptance corrections (2026-10-03)
+
+The 2026-10-02 acceptance report found real defects in the original product landing. [Repair record](docs/REPAIR_2026-10-03.md) maps A1–A9 to this working tree and records validation limits.
+
+Validation recorded on 2026-10-07: backend suite **1158 passed, 8 skipped** with PDF report tests excluded; focused runtime/product/event suite **176 passed**, including **38 new regressions**; offline evals **3/3**; frontend TypeScript passed. Real database/browser, container recovery and PDF acceptance remain pending.
+
+- Snapshots reject symlinks, preserve the exact requested scope, apply glob exclusions, and record file/byte limits and unreadable input. Reports show the full discovered scope and become partial when input was omitted.
+- Source content is a persistent artifact referenced by its hash. Resume uses that artifact, keeps progress/cancellation hooks, and refuses missing checkpoints or unverifiable legacy snapshots instead of silently restarting.
+- Static pattern rechecks remain inconclusive and do not increase confidence or mark findings verified. Plans report serial execution (`max_parallel=1`).
+- Product workers use an OS run lock before preparing a checkout or changing task state. Shared files carry cancellation and event replay; duplicate workers leave the current owner alone. Compose persists runtime files in a named volume.
+- Product assembly reads its own configured backends and accepts `file` only. Product Postgres recovery, distributed scheduling, RAG, production MCP and graph Docker verification remain outstanding; main's generic Postgres backend and sandbox worker are retained.
+
+**CLI-L1 lightweight extraction** · status: **IMPLEMENTED / DOGFOOD** (2026-08-20)
+
+- ADR-004 authorizes an independent `cli/` distribution without changing the
+  server-side Agent Runtime decisions.
+- Base CLI uses only the Python standard library plus an explicit external
+  Semgrep `1.173.0` executable.
+- Implemented: `doctor`, non-interactive `audit`, terminal/JSON output,
+  deterministic manifest, governed subprocess, E0 candidate normalization,
+  coverage/partial semantics, stable exit codes, and atomic external output.
+- Verification: 19 CLI tests, Ruff, strict MyPy, real Semgrep 1/1 longitudinal
+  scan, 17 KB wheel, and clean `--no-deps` install in a fresh venv.
+- Design record: [`docs/CLI_LIGHTWEIGHT_DESIGN.md`](docs/CLI_LIGHTWEIGHT_DESIGN.md).
 
 ## Milestone roadmap
 
@@ -690,7 +746,119 @@ Harness tools / tracer / budget_manager are now consumed mid-run:
 - Optional `GRAPH_AUDITS_ENFORCE_PROJECT_ACL` (default False) checks Project owner/member when `project_id` set.
 - Tests: unauthenticated 401/403, owner happy path, cross-user 403.
 
-**Still open (product / next work):** true mid-graph resume, multi-worker cancel/events, Postgres business store adapter.
+**Still open after R2–R5:** product multi-host Postgres resume, a SQLAlchemy graph business store, connecting graph verification to the existing sandbox worker, RAG, and registering stdio MCP on the product tool router. Single-host file resume is covered in the R2–R5 section.
+
+## R1 execution trustworthiness (2026-10-02)
+
+Landed on the experimental graph runner. The production ReAct path and the `/api/v1/agent-tasks` SSE shapes are unchanged. `get_langchain_tool()` in `tools/base.py` is unchanged: its `langchain.tools` import is still incompatible, and no production caller uses it.
+
+Behavior:
+
+- `graph/limits.py` sets `recursion_limit` from the caller's budget: 9 pipeline nodes + bounded analysis units + 8 terminal/slack steps. When both caps are positive, the unit count is `min(max_files, max_model_calls)`. `max_files == 0` means no file cap, so the model-call cap is the bound. A 100-file budget therefore uses 117, not a fixed multi-thousand ceiling. `AuditRunner.ainvoke` also sets `durability="sync"` so the previous superstep is flushed before the next.
+- `ModelUsage` records `attempt_count`, `success_count`, `failure_count`, `unknown_token_calls`, and `invalid_output_count`. `call_count` remains successful responses with known tokens. A raised call consumes one model-call attempt and counts the tokens as unknown.
+- `plan_audit` and `analyze_file` write `NodeError` plus `meta["analysis_coverage"]`. A planner failure still builds the deterministic plan and is stored as `planner_error`. A tool failure is a degraded unit. Non-JSON or a malformed findings array is invalid structured output. An acknowledgement object such as `{"ok": true}` is an empty finding list.
+- `generate_report` maps a closed failure (planned work, no findings, nothing succeeded, no degraded units, and either failed units or a planner error) to `FAILED`. A coverage gap, budget stop, truncation, or heuristic fallback is `PARTIAL` and names the unfinished units. Files dropped by `max_files` inside `build_manifest` are `coverage.omitted_units` with reason `file_budget`. Files left in `pending_task_ids` after the model-call cap stops the router are `skipped_units` with reason `budget_exhausted`. A successful plan that then exhausts the budget stays `PARTIAL`.
+- A file longer than 4000 characters is listed in `truncated_units` on the default graph. The product assembly turns on line-ranged windows; see the R2–R5 section.
+- If the graph raises, `AuditRunner` reads the last checkpoint and persists the findings, events, usage, and error message. The stored status is `FAILED`.
+
+Regression coverage is `backend/tests/test_agent_graph_r1.py`: budget-shaped step ceiling, usage addition, cancel-callback init, 16/30/100-file completion, full model timeout, heuristic degradation, partial model failure, invalid output, preview truncation, file-budget omissions, model-call queue leftovers, and exception salvage.
+
+Verification on 2026-10-02 with `backend/.venv` (Python 3.12.13). No database, Docker, paid model, or browser:
+
+```bash
+cd backend
+.venv/bin/python -m pytest \
+  tests/test_agent_domain.py \
+  tests/test_agent_graph_m2.py \
+  tests/test_agent_persistence_m3.py \
+  tests/test_agent_facade_m4.py \
+  tests/test_agent_context_m5.py \
+  tests/test_agent_sandbox_m6.py \
+  tests/test_agent_verification_m7.py \
+  tests/test_agent_tooling_m8.py \
+  tests/test_agent_observability_m9.py \
+  tests/test_agent_evals_m10.py \
+  tests/test_agent_harness_m11.py \
+  tests/test_agent_graph_r1.py \
+  -q
+# 147 passed
+```
+
+The five agent-init tests in `tests/agent/test_agents.py`, the two event-stream tests that patch `get_agent_config`, and `tests/test_executor.py::TestDynamicAgentExecutor::test_constructor_reads_config_when_timeout_is_none` passed in the same environment (117 passed together with the domain, graph, persistence, harness, and facade suites).
+
+The backend suite with report generation excluded:
+
+```bash
+cd backend
+.venv/bin/python -m pytest -q --tb=line --disable-warnings --ignore=tests/test_report_generator.py
+# 1102 passed, 8 skipped
+```
+
+Before R1 the same command was 1080 passed, 8 failed, 8 skipped. The 8 failures were the agent-init and `get_agent_config` cases above. The 14 new R1 tests account for the rest of the increase (1080 + 8 + 14 = 1102).
+
+Ruff selectors `E,F,B,C4` are clean on `limits.py`, `runner.py`, and `graph/nodes/__init__.py`. Ruff and Black are clean on `limits.py` and `tests/test_agent_graph_r1.py`. Legacy files were not reformatted. `common.py` still has a pre-existing Black wrap on `SourceLocation.code_hash`; that line was left as it was. `mypy --follow-imports=silent` on `limits.py`, `common.py`, and `runner.py` reports two pre-existing notes on `AuditRunner._graph` (missing return annotation, unused type ignore). It reported no new error in the R1 modules.
+
+Not verified in the R1 round: Postgres, Docker, a real model, the browser, the frontend build, and the CLI suite. WeasyPrint still cannot be imported here (`libgobject-2.0-0` is missing), so `tests/test_report_generator.py` was excluded from collection. That exclusion is an environment gap. It is not evidence that PDF export works or that the report code changed.
+
+## R2–R5 original landing (2026-10-02; historical)
+
+The following records the original implementation. The acceptance corrections above supersede its statements about verification, parallelism, leases and source loading.
+
+A user with a project and a model key can create an Agent audit from the existing dialog. The dialog defaults to LangGraph. Pattern confirmation is a checkbox and stays off. ReAct is the other engine button. Creating the task already schedules `_execute_agent_task`. There is still no `POST /{id}/start` route. Paused or failed graph tasks expose `POST /{id}/resume`.
+
+What the graph path does:
+
+- `LLMServiceGateway` calls `LLMService.chat_completion_raw`. Usage is copied. The response raw payload is only `{has_usage: bool}`. A missing key does not build a gateway and does not run FakeLLM as a successful model audit. The task stays partial, pattern analysis still runs, and the report says no model API key was configured.
+- Project bytes come from the server snapshot of the project root (`load_authorized_snapshot`). The graph request uses the literal `project://authorized`. Client host paths and git URLs stay rejected on `/graph-audits`.
+- Product runs set context windows, finding location checks, pattern scan, and cross-file linking when there is more than one file. Parallel width is 2 for multiple files, capped at 8. Default unit tests stay at width 1 unless they opt in.
+- Checkpoints are `FileCheckpointSaver` under `AGENT_STATE_DIR` (default `./data/agent_runtime`, relative to the process cwd). Business resume rows are stdlib sqlite (`graph_audit_records`). The UI still reads `AgentTask`, `AgentFinding`, and `AgentEvent`. A second process can continue a paused thread; the two-process test shows `a.py` analyzed only in process A and `b.py` only in process B. `create_checkpointer(backend="postgres")` raises and does not fall back to memory. Alembic head remains `008_add_files_with_findings`.
+- One worker holds a file lease. A second owner gets `LeaseBusy`, and the task is marked failed with an error event. Events during the run are the existing SSE `info` and `progress` events and replay by sequence. The activity log uses short Chinese steps, one updating file-progress line, clue lines for pattern hits, and a closing sentence with files read, elapsed time, and a clear statement that pattern hits are not confirmed vulnerabilities. A task that already finished keeps the log it stored. Resume replaces that task's findings and resets severity counts so a continuation does not insert duplicates.
+- Verification stays `NOT_RUN` unless `graph_verification` is stored on the task. When it is on, the conditional node runs `LocalAllowlistExecutor` in process (pattern hits for `eval(`, `os.system`, `innerHTML`, `SELECT *`). That can mark a finding confirmed. It is not an isolated Docker worker. `DockerSandboxExecutor` still returns FAILED.
+- `StdioMCPTransport` speaks JSON-RPC to an operator-supplied argv (`shell=False`). A local script test lists and calls a tool. The product tool router does not register it.
+- Tracer lookup prefers a ContextVar, so two concurrent tasks do not share one mutable tracer. `agent_registry.clear()` runs only for the ReAct branch.
+- CI evals: `py-vuln-sqli`, `py-safe-param`, `py-cross-file`. `python -m tests.evals.runner --ci` exits non-zero when a case fails.
+
+Frontend: both create dialogs send `engine` and `graph_verification`. The audit header shows LangGraph or ReAct, and a Resume button for paused or failed graph tasks. Task lists label `partial` and `paused` instead of treating them as waiting. After `pnpm install --frozen-lockfile`, `tsc --noEmit` passed, and the Agent Audit helper tests plus `agentTasks` API tests passed (79). A logged-in browser walkthrough was not run.
+
+Not claimed:
+
+- Postgres checkpoint or a SQLAlchemy graph store.
+- Automated model quality. Tests inject a fake gateway or omit the key. A later local trial with a user-saved model key finished partial; that run is not a CI check.
+- Docker verification, host-network sandbox, or RAG.
+- A logged-in browser walkthrough. No browser tool was available in this session.
+- WeasyPrint PDF export (`libgobject-2.0-0` is still missing).
+- The independent `cli/` package. It stays zero-backend-deps.
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/test_agent_product_r2.py \
+  tests/test_agent_graph_r1.py tests/test_agent_graph_m2.py \
+  tests/test_agent_persistence_m3.py tests/test_agent_harness_m11.py \
+  tests/test_agent_tooling_m8.py tests/test_agent_observability_m9.py \
+  tests/test_agent_facade_m4.py -q
+# 84 passed
+
+.venv/bin/python -m mypy --follow-imports=silent \
+  app/services/agent/graph/gateway.py \
+  app/services/agent/graph/context_windows.py \
+  app/services/agent/graph/verify_node.py \
+  app/services/agent/application/project_source.py \
+  app/services/agent/application/assembly.py \
+  app/services/agent/application/product_audit.py \
+  app/services/agent/persistence/file_checkpointer.py \
+  app/services/agent/persistence/sqlite_store.py \
+  app/services/agent/persistence/control.py \
+  app/services/agent/tooling/mcp_stdio.py
+# Success: no issues found in 10 source files
+
+.venv/bin/python -m tests.evals.runner --ci
+# total 3, passed 3, including py-cross-file
+
+.venv/bin/python -m pytest -q --tb=line --ignore=tests/test_report_generator.py
+# 1117 passed, 8 skipped
+```
+
+Activity log copy, same day: `activity_log.py` and `product_audit.py` passed ruff, black, and mypy. `tests/test_agent_product_r2.py` then passed 16. Frontend `tsc --noEmit` passed. A task that already finished keeps the log text it stored. A `partial` task's progress bar is 100 because the run has stopped; `analyzed_files / total_files` still shows how many files were read. `paused` keeps the phase-weighted position. The analysis-progress denominator is the queued manifest, then the plan, before a larger snapshot total.
 
 ## Package map (new under `services/agent/`)
 
@@ -711,8 +879,8 @@ harness/          # M11 AgentSpec + AgentRuntime
 
 | Surface | Status |
 |---------|--------|
-| `/api/v1/agent-tasks/*` | **Unchanged** (production ReAct) |
-| `/api/v1/graph-audits/*` | **Added** (LangGraph dual-path, M4) |
+| `/api/v1/agent-tasks/*` | **Product path.** New tasks default to `engine=graph`. `engine=react` is the classic fallback. Response and SSE field names stay the same. `POST /{id}/resume` continues a paused or failed graph task. `POST /{id}/start` is still absent; create already schedules the run. |
+| `/api/v1/graph-audits/*` | **Experimental graph API**. Defaults to `FakeLLM`; supports authorized server-resolved projects and an opt-in real gateway. Rejects client host paths. |
 
 ## Phase 1 invariants (still held)
 
@@ -745,10 +913,10 @@ harness/          # M11 AgentSpec + AgentRuntime
 
 ## Explicit non-goals (still deferred)
 
-- Full cutover of production ReAct → LangGraph (keep dual-path)
-- SQLAlchemy persistence adapter for business store
-- Real Docker worker process (socket out of API)
-- Real MCP SDK transport (interface + InMemoryMCPTransport shipped)
+- Removing the ReAct fallback (it stays available as `engine=react`)
+- SQLAlchemy persistence adapter for the graph business store (resume proof is the sqlite file)
+- Real Docker worker process (socket out of API). In-process pattern recheck stays inconclusive
+- Registering stdio MCP on the product tool router (transport is tested; InMemory transport remains the unit default)
 - Mandatory OTEL exporter install (optional bridge)
 - LLM-as-judge evals
 - Human approval UI wiring
@@ -757,14 +925,14 @@ harness/          # M11 AgentSpec + AgentRuntime
 
 | ID | Issue | Severity |
 |----|-------|----------|
-| K1 | Production still ReAct by default | Medium (intentional dual-path) |
-| K2 | ~~docker.sock on API compose~~ | **Fixed** 2026-09-11 (sandbox worker) |
-| K4 | Cancel mid-flight is cooperative/in-process | Medium |
-| K5 | ~~Memory checkpointer default~~ | **Fixed** 2026-09-11 (Postgres backend + real resume) |
-| K8 | CI now runs the full suite + smoke + evals | **Fixed** 2026-09-11 |
-| K11 | M11 harness unreferenced by production (ModelRouter dead) | Medium — wire or drop |
-| K9 | ~~GraphRecursionError over ~20 files~~ | **Fixed** 2026-09-11 |
-| K10 | ~~total_files always 0 when polling~~ | **Fixed** 2026-09-11 |
+| K1 | Old tasks with no `engine` key still run ReAct. New tasks default to graph | Low |
+| K2 | ~~docker.sock on API compose~~ | **Fixed** 2026-09-11 (dedicated sandbox worker retained in merge) |
+| K4 | Product cancellation is shared and cooperative; an in-flight model call finishes before the next unit stops | Medium |
+| K5 | Product checkpoints remain single-host files; the generic runner also supports Postgres | Medium (product Postgres migration pending) |
+| K8 | CI runs the full backend suite + smoke + evals, including product regressions | Configured; merged CI result pending |
+| K11 | Product assembly wires the M11 harness, ModelRouter and governance hooks | Integrated 2026-10-08 |
+| K9 | ~~GraphRecursionError over ~20 files~~ | **Fixed**; budget-derived bound retained |
+| K10 | ~~total_files always 0 when polling~~ | **Fixed**; persisted file count retained |
 
 ## Post-M11 audit (2026-07-24)
 
@@ -779,4 +947,4 @@ Hardening applied after audit (same day):
 
 Phase 0/1 closed host-path LFI surface + async cancel race + MCP try-all + budget COMPLETED lie + mapper field loss.
 
-Still open (tracked in audit doc): full authz parity, harness enforcement inside nodes, true mid-graph resume, multi-worker event bus.
+The linked historical audit predates the product path. Current resume and event replay support workers sharing one host directory; distributed persistence and full product acceptance remain open.

@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, Generator, Iterator, Optional
 
@@ -201,9 +202,13 @@ SPAN_REPORT = "report.generate"
 
 
 _global_tracer: Optional[Tracer] = None
+_tracer_ctx: ContextVar[Optional[Tracer]] = ContextVar("deepaudit_tracer", default=None)
 
 
 def get_tracer() -> Tracer:
+    current = _tracer_ctx.get()
+    if current is not None:
+        return current
     global _global_tracer
     if _global_tracer is None:
         _global_tracer = Tracer()
@@ -213,6 +218,15 @@ def get_tracer() -> Tracer:
 def set_tracer(tracer: Tracer) -> None:
     global _global_tracer
     _global_tracer = tracer
+
+
+def push_tracer(tracer: Tracer) -> Token[Optional[Tracer]]:
+    """Bind a tracer to this task. Concurrent tasks keep their own tracer."""
+    return _tracer_ctx.set(tracer)
+
+
+def reset_tracer_context(token: Token[Optional[Tracer]]) -> None:
+    _tracer_ctx.reset(token)
 
 
 def trace_node(node_name: str, **attrs: Any):

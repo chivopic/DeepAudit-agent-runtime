@@ -16,15 +16,23 @@ import type { LogEntryProps } from "../types";
 
 // Log type labels for display with enhanced styling
 const LOG_TYPE_LABELS: Record<string, string> = {
-  thinking: 'THINK',
-  tool: 'TOOL',
-  phase: 'PHASE',
-  finding: 'VULN',
-  dispatch: 'AGENT',
-  info: 'INFO',
-  error: 'ERROR',
-  user: 'USER',
-  progress: 'PROG',
+  thinking: '思考',
+  tool: '工具',
+  phase: '阶段',
+  finding: '发现',
+  dispatch: '调度',
+  info: '信息',
+  error: '错误',
+  user: '用户',
+  progress: '进度',
+};
+
+const SEVERITY_LABELS: Record<string, string> = {
+  critical: '严重',
+  high: '高',
+  medium: '中',
+  low: '低',
+  info: '提示',
 };
 
 // Helper to format title (remove emojis and clean up)
@@ -194,7 +202,7 @@ export const LogEntry = memo(function LogEntry({ item, isExpanded, onToggle }: L
                     ${SEVERITY_COLORS[item.severity] || SEVERITY_COLORS.info}
                   `}
                 >
-                  {item.severity}
+                  {SEVERITY_LABELS[item.severity.toLowerCase()] || item.severity}
                 </Badge>
               )}
 

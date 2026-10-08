@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from . import nodes
-from .routing import route_after_analyze, route_after_ingest, route_after_validate
+from .routing import (
+    route_after_analyze,
+    route_after_ingest,
+    route_after_prioritize,
+    route_after_validate,
+)
 from .state import AuditState
+from .verify_node import verify_audit_findings
 
 
 def build_audit_graph() -> StateGraph:
@@ -18,21 +24,24 @@ def build_audit_graph() -> StateGraph:
     Flow::
 
         START → validate_request → ingest_repository → build_manifest
-              → plan_audit → analyze_file* → aggregate_findings
+              → static_scan → plan_audit → analyze_file* → aggregate_findings
               → deduplicate_findings → prioritize_findings
-              → verify_findings → generate_report → END
+              → (verify_findings / verify_audit_findings if enabled)
+              → generate_report → END
     """
     g: StateGraph = StateGraph(AuditState)
 
     g.add_node("validate_request", nodes.validate_request)
     g.add_node("ingest_repository", nodes.ingest_repository)
     g.add_node("build_manifest", nodes.build_manifest)
+    g.add_node("static_scan", nodes.static_scan)
     g.add_node("plan_audit", nodes.plan_audit)
     g.add_node("analyze_file", nodes.analyze_file)
     g.add_node("aggregate_findings", nodes.aggregate_findings)
     g.add_node("deduplicate_findings", nodes.deduplicate_findings)
     g.add_node("prioritize_findings", nodes.prioritize_findings)
     g.add_node("verify_findings", nodes.verify_findings_node)
+    g.add_node("verify_audit_findings", verify_audit_findings)
     g.add_node("generate_report", nodes.generate_report)
     g.add_node("finalize_cancelled", nodes.finalize_cancelled)
 
@@ -53,7 +62,8 @@ def build_audit_graph() -> StateGraph:
             "__end__": END,
         },
     )
-    g.add_edge("build_manifest", "plan_audit")
+    g.add_edge("build_manifest", "static_scan")
+    g.add_edge("static_scan", "plan_audit")
     g.add_edge("plan_audit", "analyze_file")
     g.add_conditional_edges(
         "analyze_file",
@@ -66,9 +76,16 @@ def build_audit_graph() -> StateGraph:
     )
     g.add_edge("aggregate_findings", "deduplicate_findings")
     g.add_edge("deduplicate_findings", "prioritize_findings")
-    # M7 subgraph runs here when the request enables it; the node itself
-    # is a no-op otherwise, so the default path is unchanged.
-    g.add_edge("prioritize_findings", "verify_findings")
+    g.add_conditional_edges(
+        "prioritize_findings",
+        route_after_prioritize,
+        {
+            "verify_audit_findings": "verify_audit_findings",
+            "verify_findings": "verify_findings",
+            "generate_report": "generate_report",
+        },
+    )
+    g.add_edge("verify_audit_findings", "generate_report")
     g.add_edge("verify_findings", "generate_report")
     g.add_edge("generate_report", END)
     g.add_edge("finalize_cancelled", END)
@@ -80,7 +97,7 @@ def compile_audit_graph(
     *,
     checkpointer: Any = None,
     use_memory_checkpointer: bool = True,
-):
+) -> Any:
     """Compile the audit graph.
 
     Parameters

@@ -3,7 +3,7 @@
 Prefix: /api/v1/graph-audits
 
 These endpoints exercise GraphAuditFacade for dual-path validation.
-Production FE continues to use /api/v1/agent-tasks/* (ReAct).
+Production FE uses /api/v1/agent-tasks/* (graph by default; legacy ReAct selectable).
 
 Trust boundary:
 - JWT required (same ``get_current_user`` as agent-tasks).
@@ -11,7 +11,7 @@ Trust boundary:
 - Feature flag GRAPH_AUDITS_ENABLED.
 - GRAPH_AUDITS_FIXTURE_ONLY: reject client host ``local_path``.
 - Optional GRAPH_AUDITS_ENFORCE_PROJECT_ACL for Project owner/member checks.
-- Always FakeLLM offline until ModelRouter is wired.
+- FakeLLM by default; real gateway requires GRAPH_AUDITS_USE_REAL_LLM.
 """
 
 from __future__ import annotations
@@ -354,13 +354,15 @@ async def start_graph_audit(
     # Dual-path experimental route. FakeLLM by default; the real gateway only
     # when GRAPH_AUDITS_USE_REAL_LLM is set (see _resolve_llm).
     llm, offline = await _resolve_llm(db, current_user)
+    runtime_extra: dict[str, Any] = {"workspace_resolver": workspace_resolver}
+    if workspace_resolver is None and body.fixture_files is not None:
+        # Presence, including an empty map, defines an authoritative snapshot.
+        # Project sources resolve their own workspace instead of a fixture map.
+        runtime_extra["fixture_files"] = fixture_files
     runtime = GraphRuntime(
         llm=llm,
         offline=offline,
-        extra={
-            "fixture_files": fixture_files,
-            "workspace_resolver": workspace_resolver,
-        },
+        extra=runtime_extra,
     )
 
     wait = bool(body.wait) and bool(getattr(settings, "GRAPH_AUDITS_SYNC_START", False))

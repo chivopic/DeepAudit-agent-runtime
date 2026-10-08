@@ -20,6 +20,7 @@ class EvalCase:
     expected_cwe_any: list[str] = field(default_factory=list)
     expected_paths: list[str] = field(default_factory=list)
     expect_not_run_verification: bool = True
+    cross_file: bool = False
     notes: str = ""
 
 
@@ -148,6 +149,12 @@ def evaluate_case(
         }
         if not checks["status_terminal"]:
             messages.append(f"unexpected status: {status}")
+
+    if case.cross_file:
+        linked = any((f.metadata or {}).get("related_paths") for f in findings)
+        checks["cross_file"] = linked
+        if not linked:
+            messages.append("expected related_paths across files")
 
     passed = all(checks.values()) if checks else False
     return EvalResult(

@@ -134,6 +134,15 @@ class Settings(BaseSettings):
     # Default False so offline fixture dual-path tests work without Postgres projects.
     GRAPH_AUDITS_ENFORCE_PROJECT_ACL: bool = False
 
+    # Product agent runtime. New tasks default to the LangGraph engine.
+    # Old rows without agent_config.engine stay on the classic ReAct path.
+    AGENT_RUNTIME_ENGINE: str = "graph"
+    AGENT_STATE_DIR: str = "./data/agent_runtime"
+    # Product recovery also needs its file control plane and pinned artifacts.
+    # Keep this separate from the generic runner's Postgres/auto setting below.
+    AGENT_PRODUCT_CHECKPOINT_BACKEND: str = "file"
+    AGENT_CONTROL_BACKEND: str = "file"
+
     # 沙箱配置（必须）
     SANDBOX_IMAGE: str = "deepaudit/sandbox:latest"  # 沙箱 Docker 镜像
     SANDBOX_MEMORY_LIMIT: str = "512m"  # 沙箱内存限制

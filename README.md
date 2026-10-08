@@ -19,7 +19,8 @@
 </p>
 
 > **本仓库说明**：基于上游 [lintsinghua/DeepAudit](https://github.com/lintsinghua/DeepAudit) v3.0.0 的 **Agent Runtime 重构实验分支**（M0–M11）。  
-> 生产 ReAct 路径保持兼容；新增 LangGraph 双路径与协议化运行时。旧版 README 见 [`backup/`](backup/)。
+> 生产 ReAct 路径保持兼容；新增 LangGraph 双路径与协议化运行时。旧版 README 见 [`backup/`](backup/)。  
+> 新建 Agent 审计默认走 LangGraph，入口仍是 `/api/v1/agent-tasks`。对话框里可以选择经典 ReAct。产品支持单机续跑；通用运行器支持 Postgres，部署包含独立沙箱服务。产品图尚未接入多机恢复和 Docker 验证。范围见 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)。
 
 </div>
 
@@ -106,7 +107,7 @@
 | 领域模型 | **Pydantic** 统一 API、工具、沙箱 I/O |
 | 持久化 | Checkpoint ≠ 业务库 ≠ Artifact Store |
 | 安全 | Phase 1：无默认不可信执行；`verification_status=NOT_RUN` |
-| 迁移 | **双路径**：生产 ReAct 冻结；LangGraph 增量上线 |
+| 迁移 | **同一入口双引擎**：新任务默认 LangGraph，`engine=react` 保留经典路径 |
 
 用户仍可导入项目后自动完成：识别技术栈 → 分析潜在风险 → 汇总发现 → 生成报告。
 
@@ -132,35 +133,49 @@
 ### 双路径 Agent 运行时（本仓库重点）
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│  Frontend (React)  ·  /api/v1/*                             │
-├────────────────────────────┬────────────────────────────────┤
-│  生产路径（冻结兼容）         │  LangGraph 双路径（本分支新增）   │
-│  /api/v1/agent-tasks/*     │  /api/v1/graph-audits/*        │
-│  ReAct Multi-Agent         │  AuditRunner + StateGraph      │
-└────────────────────────────┴────────────────────────────────┘
-                              │
-          ┌───────────────────┼───────────────────┐
-          ▼                   ▼                   ▼
-   domain/ (Pydantic)   graph/ (LangGraph)   persistence/
-   tooling/  sandbox/   harness/             context/
-   observability/       application façade
+Frontend (React)  ·  /api/v1/*
+  /api/v1/agent-tasks/*
+    engine=graph   默认，AuditRunner + StateGraph
+    engine=react   显式经典 ReAct
+  /api/v1/graph-audits/*   实验接口，默认 FakeLLM，可审计授权项目
+        │
+        ▼
+ domain/   graph/   persistence/   tooling/   sandbox/
+ harness/  context/ observability/ application/
 ```
 
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
-| M0 | 架构评估 / ADR | ✅ |
+| M0 | 架构评估 / ADR | ✅ 实验运行时 |
 | M1 | 领域模型 | ✅ |
 | M2 | LangGraph 骨架 + FakeLLM | ✅ |
-| M3 | Checkpoint + 业务/制品存储 | ✅ |
+| M3 | Checkpoint + 业务/制品存储 | ✅ 实验存储；产品续跑是单机文件 |
 | M4 | API 门面 / 事件 / cancel / resume | ✅ |
 | M5 | Context Manager | ✅ |
-| M6 | Sandbox 策略 + 执行器 | ✅ |
-| M7 | Verification 子图 | ✅ |
-| M8 | MCP / ToolRegistry | ✅ |
+| M6 | Sandbox 策略 + 执行器 | ✅ 策略在；Docker 工人未接上 |
+| M7 | Verification 子图 | ✅ 默认关闭；开启后只复查模式，结果仍未确认 |
+| M8 | MCP / ToolRegistry | ✅ 实验注册表；产品路由未挂 stdio MCP |
 | M9 | 可观测性 / 脱敏 | ✅ |
 | M10 | Evals + CI | ✅ |
 | M11 | Agent Harness（包装 LangGraph） | ✅ |
+
+M0–M11 是实验运行时的完成记录。用户从现有创建框启动的是 R2–R5 产品路径。
+
+### 现在能用的产品路径
+
+新建任务仍提交到 `/api/v1/agent-tasks`。默认引擎是 LangGraph，同一对话框可以改回经典 ReAct。创建成功就会开始执行，没有单独的 `POST /{id}/start`。暂停或失败的图任务用 `POST /{id}/resume` 从本机文件 checkpoint 和首次保存的源码快照接着跑。没有源码快照的旧任务需要新建。已完成、部分完成、已取消再继续不会重跑。
+
+页面日志是中文短句：先列文件，再对照常见危险写法，然后逐个文件更新「分析进度」。进度分母是这次排进队列的文件数。模式命中写成线索，不叫已确认漏洞。模型意见单独标出。结束语写明看了多少文件、用了多久。已经结束的旧任务保留当时存下的原文，刷新不会改写。
+
+进度条在 `partial` 时是 100，表示这次运行已经停下来。文件覆盖仍是「已分析 / 总数」，例如 7/15。暂停中的任务仍按阶段权重显示当前位置。
+
+没有模型密钥时任务停在部分完成，只做模式扫描，不会用假模型冒充一次成功的模型审计。验证勾选默认关闭，发现保持未确认。勾上之后只做代码模式复查，结果仍为未确认，不会提高置信度或标记漏洞已验证。实验接口 `/api/v1/graph-audits` 默认使用 FakeLLM，也支持服务端解析的授权项目；真实模型需显式启用 `GRAPH_AUDITS_USE_REAL_LLM`。
+
+通用运行器的 PostgreSQL 检查点和独立沙箱服务已保留。产品图仍待接入多机续跑、Docker 验证、RAG 和 stdio MCP。
+
+产品恢复使用 `AGENT_PRODUCT_CHECKPOINT_BACKEND=file`、`AGENT_CONTROL_BACKEND=file` 和共享的 `AGENT_STATE_DIR`。通用运行器继续使用 `AGENT_CHECKPOINT_BACKEND`（默认 `auto`，支持 `postgres`）；两组检查点配置互不覆盖。
+
+当前分析按文件串行执行。文件或字节上限、不可读文件会记录为覆盖缺口，结果为部分完成。2026-10-02 验收暴露的问题及修复范围见 [修复记录](docs/REPAIR_2026-10-03.md)；完整产品验收仍未完成。
 
 详情：[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) · [复盘与代码审计](docs/implementation/m0-m11-retro-and-audit.md) · [目标架构](docs/implementation/target-architecture.md)
 
@@ -302,8 +317,10 @@ uv run pytest \
   tests/test_agent_observability_m9.py \
   tests/test_agent_evals_m10.py \
   tests/test_agent_harness_m11.py \
+  tests/test_agent_graph_r1.py \
+  tests/test_agent_product_r2.py \
   -q
-# 期望：121 passed
+# 通过数以 IMPLEMENTATION_STATUS.md 里当次记录为准
 
 uv run python -m tests.evals.runner --ci
 ```
@@ -406,8 +423,8 @@ DeepSeek-Coder · Codestral<br/>
 | 功能 | 说明 | 模式 |
 |------|------|------|
 | 🤖 **Agent 深度审计** | Multi-Agent 协作 / LangGraph 双路径 | Agent |
-| 🧠 **RAG 知识增强** | 代码语义与知识库检索 | Agent |
-| 🔒 **沙箱策略化执行** | Allowlist + NullSandbox（Phase 1） | Agent |
+| 🧠 **RAG 知识增强** | 产品知识库仍在；LangGraph 路径尚未接入 | Agent |
+| 🔒 **沙箱策略化执行** | 默认不跑不可信代码；勾选后仅进程内模式确认 | Agent |
 | 🧩 **协议化运行时** | Domain / Graph / Store / Tools / Harness | 本分支 |
 | 📊 **确定性评测** | FakeLLM + evals + GitHub Actions | 本分支 |
 | 🗂️ **项目管理** | GitHub/GitLab/Gitea / ZIP | 通用 |
@@ -423,10 +440,11 @@ DeepSeek-Coder · Codestral<br/>
 - [x] RAG 知识库 + Docker 安全沙箱
 - [x] Multi-Agent 协作架构（生产 ReAct）
 - [x] **Agent Runtime M0–M11**（LangGraph + 协议边界 + Harness）
-- [ ] `/graph-audits` 与生产一致的鉴权 / 多租户
-- [ ] 将 ToolRegistry / Tracer / Budget **接入图节点**
-- [ ] 真·中断恢复（非 re-drive）
-- [ ] 沙箱 Worker 进程化（ADR-003）
+- [x] `/graph-audits` JWT 与所有者校验
+- [x] ToolRegistry / Tracer / Budget 接入图节点
+- [x] 单机文件 checkpoint 续跑（`/api/v1/agent-tasks`）
+- [ ] Postgres 多机续跑
+- [x] 沙箱 Worker 进程化（ADR-003）；产品图验证接入待完成
 - [ ] 自动修复 (Auto-Fix) / 增量 PR 审计 / CI 集成
 
 ---

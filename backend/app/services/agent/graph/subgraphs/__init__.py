@@ -7,6 +7,7 @@ When allow_execution and sandbox allowlisted actions: optional confirmation sign
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from typing import Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -72,9 +73,7 @@ def select_verification_strategy(state: VerificationState) -> dict:
     }
 
 
-async def verify_finding(
-    state: VerificationState, config: Optional[RunnableConfig] = None
-) -> dict:
+async def verify_finding(state: VerificationState, config: Optional[RunnableConfig] = None) -> dict:
     """Run verification for a single finding."""
     finding = state["finding"]
     req = state["request"]
@@ -144,20 +143,20 @@ async def verify_finding(
                 summary=sres.stderr,
             )
         elif sres.status is ExecutionStatus.SUCCEEDED:
-            hits = sres.stdout or ""
-            confirmed = "hits=" in hits and hits != "hits="
+            # A successful static analyzer call proves only that it ran.
+            # File-wide pattern hits cannot verify this finding's exploitability.
             result = VerificationResult(
                 request_id=req.id,
                 finding_id=finding.id,
-                status=(
-                    VerificationStatus.CONFIRMED
-                    if confirmed
-                    else VerificationStatus.INCONCLUSIVE
-                ),
+                status=VerificationStatus.INCONCLUSIVE,
                 execution_status=ExecutionStatus.SUCCEEDED,
-                confidence=min(1.0, finding.confidence + (0.2 if confirmed else 0.0)),
-                summary=hits or "sandbox ok",
-                details={"stdout": sres.stdout, "duration_ms": sres.duration_ms},
+                confidence=finding.confidence,
+                summary="static pattern recheck; exploitability remains unverified",
+                details={
+                    "method": "static_pattern_recheck",
+                    "stdout": sres.stdout,
+                    "duration_ms": sres.duration_ms,
+                },
             )
         else:
             result = VerificationResult(
@@ -211,6 +210,10 @@ def update_confidence(state: VerificationState) -> dict:
             "confidence": result.confidence,
             "verification_notes": result.summary,
             "verification_artifact": result.artifact,
+            "metadata": {
+                **(finding.metadata or {}),
+                "verification_method": result.details.get("method", "static_recheck"),
+            },
         }
     )
     vf = VerifiedFinding(**data)
@@ -228,11 +231,7 @@ def update_confidence(state: VerificationState) -> dict:
 
 
 # Optional injection when LangGraph does not pass config into sync nodes
-from contextvars import ContextVar
-
-_sandbox_ctx: ContextVar[Optional[SandboxExecutor]] = ContextVar(
-    "deepaudit_sandbox", default=None
-)
+_sandbox_ctx: ContextVar[Optional[SandboxExecutor]] = ContextVar("deepaudit_sandbox", default=None)
 
 
 def set_sandbox(sandbox: SandboxExecutor):
@@ -318,9 +317,7 @@ async def verify_findings(
 ) -> list[VerifiedFinding]:
     """Batch verify. Default Phase 1: static skip path."""
     out: list[VerifiedFinding] = []
-    sb = sandbox or (
-        LocalAllowlistExecutor() if allow_execution else NullSandboxExecutor()
-    )
+    sb = sandbox or (LocalAllowlistExecutor() if allow_execution else NullSandboxExecutor())
     for f in findings:
         req = VerificationRequest(
             finding_id=f.id,

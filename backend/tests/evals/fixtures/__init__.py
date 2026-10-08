@@ -80,16 +80,40 @@ def mixed_command_injection() -> EvalCase:
     )
 
 
+def python_cross_file() -> EvalCase:
+    return EvalCase(
+        id="py-cross-file",
+        language="python",
+        category="vulnerable",
+        files={
+            "app/a.py": (
+                "def lookup(conn, name):\n"
+                "    return conn.execute(\"SELECT * FROM users WHERE name = \" + name)\n"
+            ),
+            "app/b.py": (
+                "def search(conn, name):\n"
+                "    return conn.execute(\"SELECT * FROM accounts WHERE name = \" + name)\n"
+            ),
+        },
+        expected_min_findings=2,
+        expected_paths=["app/a.py", "app/b.py"],
+        cross_file=True,
+        notes="same SQL pattern in two files",
+    )
+
+
 ALL_CASES: list[EvalCase] = [
     python_vulnerable_sqli(),
     python_safe_param(),
     js_vulnerable_xss(),
     mixed_command_injection(),
+    python_cross_file(),
 ]
 
 
-# Small CI set: one vuln + one safe
+# Small CI set: one vuln + one safe + one cross-file case
 CI_CASES: list[EvalCase] = [
     python_vulnerable_sqli(),
     python_safe_param(),
+    python_cross_file(),
 ]

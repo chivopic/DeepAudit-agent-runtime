@@ -8,13 +8,14 @@ Backends:
     memory    in-process dict. Tests and local development.
     postgres  survives a restart. What production wants.
     sqlite    file-backed, single-process.
+    file      serialized checkpoints at an explicitly supplied path.
     auto      postgres if a DSN is configured, else memory.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,8 @@ def forget_unreachable_dsns() -> None:
     """Clear the negative cache (tests, or after fixing connectivity)."""
     _unreachable.clear()
 
-CheckpointerBackend = Literal["memory", "sqlite", "postgres", "auto"]
+
+CheckpointerBackend = Literal["memory", "sqlite", "file", "postgres", "auto"]
 
 
 def settings_or_default() -> Any:
@@ -48,23 +50,25 @@ class CheckpointerFactory:
         self,
         backend: CheckpointerBackend = "auto",
         *,
-        sqlite_path: Optional[str] = None,
-        dsn: Optional[str] = None,
+        sqlite_path: str | None = None,
+        dsn: str | None = None,
+        path: str | None = None,
     ) -> None:
         self.backend = backend
         self.sqlite_path = sqlite_path or ":memory:"
         self.dsn = dsn
+        self.path = path
 
     def create(self) -> Any:
         """Synchronous creation. Postgres needs ``acreate`` — it opens a pool."""
         if self.backend == "memory":
             return self._memory()
+        if self.backend == "file":
+            return self._file()
         if self.backend == "sqlite":
             return self._sqlite()
         if self.backend == "postgres":
-            raise RuntimeError(
-                "the postgres checkpointer is async; use acreate()"
-            )
+            raise RuntimeError("the postgres checkpointer is async; use acreate()")
         # auto without an event loop cannot open a pool, so fall back.
         try:
             return self._sqlite()
@@ -82,6 +86,8 @@ class CheckpointerFactory:
         but it says so at WARNING. Silent degradation is its own bug class.
         """
         backend = self.backend
+        if backend == "file":
+            return self._file()
         if backend == "postgres":
             return await self._postgres()
         if backend == "sqlite":
@@ -104,7 +110,7 @@ class CheckpointerFactory:
                 )
         return self._memory()
 
-    def _resolve_dsn(self) -> Optional[str]:
+    def _resolve_dsn(self) -> str | None:
         """Postgres DSN for the checkpointer.
 
         The application speaks SQLAlchemy (``postgresql+asyncpg://``); psycopg
@@ -176,6 +182,13 @@ class CheckpointerFactory:
 
         return MemorySaver()
 
+    def _file(self) -> Any:
+        if not self.path:
+            raise RuntimeError("file checkpointer requires a path")
+        from app.services.agent.persistence.file_checkpointer import FileCheckpointSaver
+
+        return FileCheckpointSaver(self.path)
+
     def _sqlite(self) -> Any:
         # Optional extra — may not be installed in this repo pin.
         try:
@@ -197,21 +210,23 @@ class CheckpointerFactory:
 def create_checkpointer(
     backend: CheckpointerBackend = "memory",
     *,
-    sqlite_path: Optional[str] = None,
-    dsn: Optional[str] = None,
+    sqlite_path: str | None = None,
+    dsn: str | None = None,
+    path: str | None = None,
 ) -> Any:
     return CheckpointerFactory(
-        backend=backend, sqlite_path=sqlite_path, dsn=dsn
+        backend=backend, sqlite_path=sqlite_path, dsn=dsn, path=path
     ).create()
 
 
 async def acreate_checkpointer(
     backend: CheckpointerBackend = "auto",
     *,
-    sqlite_path: Optional[str] = None,
-    dsn: Optional[str] = None,
+    sqlite_path: str | None = None,
+    dsn: str | None = None,
+    path: str | None = None,
 ) -> Any:
     """Async factory. Required for the postgres backend, which opens a pool."""
     return await CheckpointerFactory(
-        backend=backend, sqlite_path=sqlite_path, dsn=dsn
+        backend=backend, sqlite_path=sqlite_path, dsn=dsn, path=path
     ).acreate()

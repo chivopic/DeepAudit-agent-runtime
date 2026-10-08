@@ -6,8 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.services.agent.domain import (
-    ArtifactRef,
     ArtifactKind,
+    ArtifactRef,
     AuditPlan,
     AuditReport,
     AuditRequest,
@@ -15,13 +15,16 @@ from app.services.agent.domain import (
     AuditTaskSpec,
     CandidateFinding,
     Evidence,
+    EvidenceLevel,
     FileArtifact,
     Finding,
+    FindingState,
     FindingStatus,
     FixProposal,
     ModelUsage,
     NodeError,
     NodeErrorCode,
+    ReasoningArtifact,
     RepositoryManifest,
     RepositoryRef,
     RepositorySnapshot,
@@ -36,7 +39,6 @@ from app.services.agent.domain import (
     finding_to_legacy_dict,
     fingerprint_components,
 )
-
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -255,6 +257,8 @@ class TestFindings:
         f = Finding(title="XSS", description="reflected")
         assert f.verification_status is VerificationStatus.NOT_RUN
         assert f.status is FindingStatus.NEW
+        assert f.evidence_level is EvidenceLevel.E0
+        assert f.finding_state is FindingState.CANDIDATE
 
     def test_blank_title_rejected(self):
         with pytest.raises(ValidationError):
@@ -273,6 +277,37 @@ class TestFindings:
     def test_evidence_kind(self):
         with pytest.raises(ValidationError):
             Evidence(kind="video", summary="nope")
+
+    def test_verified_state_requires_e3_and_confirmation(self):
+        with pytest.raises(ValidationError, match="evidence_level=E3"):
+            Finding(
+                title="t",
+                description="d",
+                finding_state=FindingState.VERIFIED,
+            )
+        verified = Finding(
+            title="t",
+            description="d",
+            finding_state=FindingState.VERIFIED,
+            evidence_level=EvidenceLevel.E3,
+            verification_status=VerificationStatus.CONFIRMED,
+        )
+        assert verified.finding_state is FindingState.VERIFIED
+
+    def test_reasoning_artifact_is_separate_from_evidence(self):
+        artifact = ReasoningArtifact(
+            finding_id="fnd_1",
+            evidence_summary="The scanner matched eval().",
+            supporting_evidence_ids=["ev_1"],
+            limitations=["Input reachability is not established."],
+        )
+        finding = Finding(
+            title="Possible injection",
+            description="Candidate only",
+            reasoning_artifacts=[artifact],
+        )
+        assert finding.reasoning_artifacts == [artifact]
+        assert finding.evidence == []
 
     def test_verified_finding_extends(self):
         vf = VerifiedFinding(
@@ -326,9 +361,7 @@ class TestVerification:
 class TestAuditRequest:
     def test_valid_request(self):
         req = AuditRequest(
-            repository=RepositoryRef(
-                source_type="git", url="https://example.com/r.git"
-            ),
+            repository=RepositoryRef(source_type="git", url="https://example.com/r.git"),
             languages=["python"],
             include_paths=["src/"],
             exclude_paths=["vendor/"],
@@ -428,9 +461,7 @@ class TestMappers:
             description="redirect to user URL",
             severity=Severity.MEDIUM,
             location=SourceLocation(file_path="web/views.py", start_line=5),
-            evidence=[
-                Evidence(kind="code", summary="redirect", snippet="redirect(url)")
-            ],
+            evidence=[Evidence(kind="code", summary="redirect", snippet="redirect(url)")],
             recommendation="allowlist hosts",
             tags=["web"],
         )
@@ -439,15 +470,15 @@ class TestMappers:
         assert d["line_start"] == 5
         assert d["code_snippet"] == "redirect(url)"
         assert d["severity"] == "medium"
+        assert d["evidence_level"] == "E0"
+        assert d["finding_state"] == "candidate"
         f2 = finding_from_legacy_dict(d)
         assert f2.title == f.title
         assert f2.severity is Severity.MEDIUM
         assert f2.location and f2.location.file_path == "web/views.py"
 
     def test_from_legacy_unknown_severity_defaults(self):
-        f = finding_from_legacy_dict(
-            {"title": "x", "description": "y", "severity": "ultra"}
-        )
+        f = finding_from_legacy_dict({"title": "x", "description": "y", "severity": "ultra"})
         assert f.severity is Severity.MEDIUM
 
     def test_from_legacy_vulnerability_type_and_ai_confidence(self):
